@@ -174,6 +174,7 @@ class RunReport:
     left_open: int = 0
     shifted_packages: int = 0
     repaired_escapes: int = 0  # answers with doubled backslashes (\\\\n) repaired
+    repaired_newlines: int = 0  # answers with real line breaks where the source has a literal \n
     requests: int = 0
     stopped: str | None = None
     quota_remaining: int | None = None
@@ -692,8 +693,10 @@ class Runner:
         if not result.ok:
             return {en: ("batch", None, None) for en in texts}
         raw = [result.texts.get(str(i)) for i in range(len(texts))]
-        answers = [validate.repair_escapes(en, de) for en, de in zip(texts, raw)]
-        repaired = sum(1 for a, b in zip(raw, answers) if a is not b)
+        unescaped = [validate.repair_escapes(en, de) for en, de in zip(texts, raw)]
+        answers = [validate.repair_newlines(en, de) for en, de in zip(texts, unescaped)]
+        repaired = sum(1 for a, b in zip(raw, unescaped) if a is not b)
+        relined = sum(1 for a, b in zip(unescaped, answers) if a is not b)
         suspicion = self._diagnose(texts, answers) if len(texts) > 1 else None
         # shifted echoes of the English texts are unchanged answers, no broken model
         echo = suspicion is not None and self._diagnose(texts, self._without_echoes(texts, answers)) is None
@@ -708,9 +711,10 @@ class Runner:
             if len(texts) > self.opts.retry_items:
                 return {en: ("shifted", result.model, None) for en in texts}
             return self._split(texts, keys, final, avoid, depth)
-        if repaired:
+        if repaired or relined:
             with self._stats_lock:
                 self.report.repaired_escapes += repaired
+                self.report.repaired_newlines += relined
         failures: dict[str, tuple] = {}
         for en, de in zip(texts, answers):
             reason = validate.check(en, de)

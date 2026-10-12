@@ -164,9 +164,10 @@ def cmd_repair_rejects(args: argparse.Namespace, cfg: Config) -> int:
         cfg.rejects_path, cfg.translations_path, apply=args.apply))
     if report is None:
         return 1
-    print(f"Reparatur doppelt escapter Backslashes aus {cfg.rejects_path.name} ("
+    print(f"Reparatur doppelt escapter Backslashes und echter Zeilenumbrueche aus {cfg.rejects_path.name} ("
           + ("wird geschrieben" if args.apply else "Probelauf") + ")")
-    print(f"  Backslash-Ablehnungen:    {fmt(report.candidates):>6}")
+    print(f"  Backslash-Ablehnungen:    {fmt(report.candidates_by_reason['backslash']):>6}")
+    print(f"  Zeilenumbruch-Ablehnungen:{fmt(report.candidates_by_reason['newline']):>6}")
     print(f"  gueltig nach Reparatur:   {fmt(report.repaired):>6} -> {cfg.translations_path.name}")
     still = sum(report.still_invalid.values())
     print(f"  weiter ungueltig:         {fmt(still):>6}"

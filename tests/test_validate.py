@@ -225,6 +225,64 @@ def test_repair_ignores_non_strings():
     assert repair_escapes("x", None) is None
 
 
+# -- real line breaks where the source has a literal \n (192 of 244 real rejects) ----------
+from mdde.validate import repair_newlines  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "en,de,fixed",
+    [
+        ("Line one\\nLine two", "Zeile eins\nZeile zwei", "Zeile eins\\nZeile zwei"),
+        ("Line one\\nLine two", "Zeile eins\r\nZeile zwei", "Zeile eins\\nZeile zwei"),  # CRLF is one break
+        ("§YA§!\\n\\nB", "§YA§!\n\nB", "§YA§!\\n\\nB"),
+        (  # the real SPY_MIL_EFFECTS_MAX shape
+            "max.\\n[?global.SPY_mil_recon_factor_max_array^i|G1%]\\n[?global.x^i|G1%]",
+            "max.\n[?global.SPY_mil_recon_factor_max_array^i|G1%]\n[?global.x^i|G1%]",
+            "max.\\n[?global.SPY_mil_recon_factor_max_array^i|G1%]\\n[?global.x^i|G1%]",
+        ),
+        ("Mix\\nof\\nboth", "Gemischt\\nvon\nbeiden", "Gemischt\\nvon\\nbeiden"),
+    ],
+)
+def test_real_line_breaks_become_literal_escapes(en, de, fixed):
+    assert check(en, de) == "newline"
+    assert repair_newlines(en, de) == fixed
+
+
+def test_repaired_line_breaks_pass_the_check():
+    en, de = "Line one\\nLine two", "Zeile eins\nZeile zwei"
+    assert check(en, repair_newlines(en, de)) is None
+
+
+def test_a_wrong_number_of_line_breaks_is_left_to_the_token_check():
+    en, de = "Line one\\nLine two", "Zeile eins\n\nZeile zwei"
+    assert repair_newlines(en, de) == "Zeile eins\\n\\nZeile zwei"
+    assert check(en, repair_newlines(en, de)) == "tokens"
+
+
+@pytest.mark.parametrize(
+    "en,de",
+    [
+        ("One single line", "Eine\nZeile"),  # the source has no \n: a real break is a model fault
+        ("Line one\\nLine two", "Zeile eins Zeile zwei"),  # Unicode separators stay rejected
+        ("Line one\\nLine two", "Zeile eins Zeile zwei"),
+        ("Line one\\nLine two", "Zeile eins\x85Zeile zwei"),
+        ("Line one\\nLine two", "Zeile eins\rZeile zwei"),  # a lone CR is no line break of a model
+        ("Line one\\nLine two", "Zeile eins\\nZeile zwei"),  # nothing to repair
+    ],
+)
+def test_newline_repair_leaves_other_texts_alone(en, de):
+    assert repair_newlines(en, de) is de
+
+
+@pytest.mark.parametrize("en,de", [("One single line", "Eine\nZeile"), ("A\\nB", "A B")])
+def test_unrepaired_line_breaks_are_still_rejected(en, de):
+    assert check(en, repair_newlines(en, de)) == "newline"
+
+
+def test_newline_repair_ignores_non_strings():
+    assert repair_newlines("A\\nB", None) is None
+
+
 # -- review 2, W-4: unchanged answers that obviously still need German -------------------
 from mdde.validate import looks_translatable  # noqa: E402
 

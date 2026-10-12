@@ -13,8 +13,9 @@ copied to ``translations.jsonl.bak-<UTC timestamp>`` and then replaced
 atomically by the cleaned version (older duplicates and broken lines go too).
 
 ``repair_rejects`` (``revalidate --repair-rejects``) works offline on
-``rejects.jsonl``: answers rejected for ``backslash`` whose only fault is the
-model's double escaping (``\\\\n``, ``\\\\"``) are repaired and, with ``apply``,
+``rejects.jsonl``: answers rejected for ``backslash`` or ``newline`` whose only
+fault is the model's double escaping (``\\\\n``, ``\\\\"``) or a real line break
+where the English text has a literal ``\\n`` are repaired and, with ``apply``,
 appended to the cache (after a backup). The reject log stays as it is - a
 cached translation always wins over a reject.
 """
@@ -143,10 +144,15 @@ def revalidate(md_root: Path, cache_path: Path, rejects: RejectLog, unchanged: U
     return report
 
 
+REPAIRABLE_REASONS = ("backslash", "newline")
+
+
 @dataclass
 class RepairReport:
-    candidates: int = 0  # newest reject per key + English text with reason "backslash"
+    candidates: int = 0  # newest reject per key + English text with a reason of REPAIRABLE_REASONS
     repaired: int = 0  # valid after the repair
+    candidates_by_reason: Counter = field(default_factory=Counter)
+    repaired_by_reason: Counter = field(default_factory=Counter)
     still_invalid: Counter = field(default_factory=Counter)
     without_answer: int = 0
     already_cached: int = 0
@@ -180,9 +186,11 @@ def repair_rejects(rejects_path: Path, cache_path: Path, *, apply: bool = False,
     cache = TranslationCache(cache_path)
     fixes: list[dict] = []
     for rec in latest.values():
-        if rec.get("reason") != "backslash":
+        reason = rec.get("reason")
+        if reason not in REPAIRABLE_REASONS:
             continue
         report.candidates += 1
+        report.candidates_by_reason[reason] += 1
         key, en, de = rec["key"], rec["en"], rec.get("de")
         if cache.get(key, en) is not None:
             report.already_cached += 1
@@ -190,12 +198,13 @@ def repair_rejects(rejects_path: Path, cache_path: Path, *, apply: bool = False,
         if not isinstance(de, str):
             report.without_answer += 1
             continue
-        fixed = validate.repair_escapes(en, de)
-        reason = validate.check(en, fixed)
-        if reason is not None:
-            report.still_invalid[reason] += 1
+        fixed = validate.repair_newlines(en, validate.repair_escapes(en, de))
+        problem = validate.check(en, fixed)
+        if problem is not None:
+            report.still_invalid[problem] += 1
             continue
         report.repaired += 1
+        report.repaired_by_reason[reason] += 1
         fixes.append({**rec, "de": fixed})
     report.examples = [(r["key"], r["en"], r["de"]) for r in fixes]
     if apply and fixes:

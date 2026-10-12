@@ -305,6 +305,19 @@ def repair_escapes(en: str, de: object) -> object:
     return _DOUBLE_ESCAPE_RE.sub(lambda m: "\\", de)
 
 
+def repair_newlines(en: str, de: object) -> object:
+    """Undo a model's unescaping of ``\\n``: real ``\\r\\n``/``\\n`` -> literal ``\\n``.
+
+    Only when the English text has a literal ``\\n`` of its own; a lone ``\\r``,
+    U+2028/U+2029/U+0085 and every other text (and a non-string) are returned
+    unchanged (same object). ``check`` decides afterwards - the token comparison
+    rejects a wrong number of line breaks.
+    """
+    if not isinstance(de, str) or "\\n" not in en or "\n" not in de:
+        return de
+    return de.replace("\r\n", "\\n").replace("\n", "\\n")
+
+
 def _wrapped_in_quotes(text: str) -> bool:
     t = text.strip().replace('\\"', '"')
     return (

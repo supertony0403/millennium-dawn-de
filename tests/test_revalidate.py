@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -177,6 +178,52 @@ def test_cli_repair_rejects_is_a_dry_run_and_needs_no_md(reject_dir, tmp_path, m
     assert (reject_dir / "translations.jsonl").read_bytes() == before
     assert main(["revalidate", "--repair-rejects", "--apply"]) == 0
     assert TranslationCache(reject_dir / "translations.jsonl").get("a", "Line one\\nLine two") is not None
+
+
+@pytest.fixture
+def newline_dir(tmp_path):
+    path = tmp_path / "cache"
+    path.mkdir()
+    lines = [
+        reject("n1", "Line one\\nLine two", "newline", "Zeile eins\nZeile zwei"),  # repairable
+        reject("n2", "§YA§!\\n\\nB", "newline", "§YA§!\r\n\r\nBe"),  # repairable (CRLF)
+        reject("n3", "One single line", "newline", "Eine\nZeile"),  # source without \n: stays invalid
+        reject("n4", "A\\nB", "newline", "A B"),  # Unicode separator: stays invalid
+        reject("n5", "Line one\\nLine two", "newline", "Zeile eins\n\nZeile zwei"),  # one break too many
+        reject("b1", "Line one\\nLine two", "backslash", "Zeile eins\\\\nZeile zwei"),  # old repair still works
+    ]
+    (path / "rejects.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def test_repair_rejects_also_repairs_real_line_breaks(newline_dir):
+    report = repair(newline_dir, apply=False)
+    assert report.candidates == 6
+    assert report.candidates_by_reason == {"newline": 5, "backslash": 1}
+    assert report.repaired == 3
+    assert report.repaired_by_reason == {"newline": 2, "backslash": 1}
+    assert report.still_invalid == {"newline": 2, "tokens": 1}
+    assert [(k, de) for k, _, de in report.examples] == [
+        ("n1", "Zeile eins\\nZeile zwei"), ("n2", "§YA§!\\n\\nBe"), ("b1", "Zeile eins\\nZeile zwei")]
+
+
+def test_repair_rejects_apply_writes_repaired_line_breaks(newline_dir):
+    report = repair(newline_dir, apply=True)
+    cache = TranslationCache(newline_dir / "translations.jsonl")
+    assert cache.get("n1", "Line one\\nLine two") == "Zeile eins\\nZeile zwei"
+    assert cache.get("n2", "§YA§!\\n\\nB") == "§YA§!\\n\\nBe"
+    assert cache.get("n3", "One single line") is None
+    assert report.repaired == 3
+
+
+def test_cli_repair_rejects_shows_the_line_break_count(newline_dir, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("MDDE_MD_ROOT", str(tmp_path / "no_md_here"))
+    monkeypatch.setenv("MDDE_CACHE_DIR", str(newline_dir))
+    assert main(["revalidate", "--repair-rejects"]) == 0
+    out = capsys.readouterr().out
+    assert re.search(r"Zeilenumbruch-Ablehnungen:\s+5", out), out
+    assert re.search(r"Backslash-Ablehnungen:\s+1", out), out
+    assert re.search(r"gueltig nach Reparatur:\s+3", out), out
 
 
 # -- review 2, k-3: lines are split at \n only ---------------------------------------------

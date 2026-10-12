@@ -491,6 +491,21 @@ def test_doubly_escaped_answers_are_repaired_and_cached(tmp_path):
     assert len(env.chat_calls) == 1
 
 
+def test_real_line_breaks_are_repaired_cached_and_counted(tmp_path):
+    table = {"Line one\\nLine two": "Zeile eins\nZeile zwei",
+             "§YA§!\\n\\nB": "§YA§!\r\n\r\nBe",
+             "One single line": "Eine\nZeile"}  # the source has no \n: stays a reject
+    env = Env(tmp_path, responder=translator(table))
+    report = env.runner.run([("a", "Line one\\nLine two"), ("b", "§YA§!\\n\\nB"), ("c", "One single line")])
+    assert env.cache.get("a", "Line one\\nLine two") == "Zeile eins\\nZeile zwei"
+    assert env.cache.get("b", "§YA§!\\n\\nB") == "§YA§!\\n\\nBe"
+    assert env.cache.get("c", "One single line") is None
+    assert report.repaired_newlines == 2
+    assert report.repaired_escapes == 0
+    summary = json.loads((tmp_path / "logs" / "last_run.json").read_text())
+    assert summary["repaired_newlines"] == 2
+
+
 # -- review 2, W-4: unchanged but translatable answers get a second chance ----------------
 TOGGLE = "§YToggle Cheat Decisions§!"
 
