@@ -1089,6 +1089,94 @@ def test_a_quiet_moment_at_the_start_does_not_hide_a_busy_program():
     assert server["rem"] >= 100
 
 
+# -- review 4, W1: requests passing the gate while /key is on the way --------------------
+def test_requests_wait_for_a_key_answer_on_the_way_and_are_not_counted_as_external():
+    # five workers reach the gate while the query after the first request is on the way;
+    # the server counts their requests before it answers. Before the fix they passed and
+    # looked like another program's: rate 5 -> 100 + 6 * 6 (start 160: 6 requests, not 54)
+    from mdde.translate import Budget
+
+    lock, server, asking = threading.Lock(), {"rem": 1000, "calls": 0}, threading.Event()
+
+    def quota():
+        with lock:
+            server["calls"] += 1
+            calls = server["calls"]
+        if calls == 2:
+            asking.set()
+            time.sleep(0.3)
+        with lock:
+            return {"limit": 1000, "remaining": server["rem"]}
+
+    budget = Budget(quota, RunOptions(), None, lambda: NOON, lambda line: None)
+    budget.start()
+
+    def request():
+        budget()
+        with lock:
+            server["rem"] -= 1  # counted on arrival, at once
+
+    request()
+    asker = threading.Thread(target=request)  # the second request queries /key
+    asker.start()
+    assert asking.wait(2)
+    others = [threading.Thread(target=request) for _ in range(5)]
+    for thread in others:
+        thread.start()
+    for thread in [asker, *others]:
+        thread.join()
+    assert budget.used == 7
+    assert server["calls"] == 2
+    assert budget.threshold == 106
+
+
+def run_workers(budget, server, lock, cost, workers=6, flight=0.03):
+    """``workers`` threads send requests through ``budget`` until it stops; each reaches the
+    server 5 ms after the gate and costs ``cost`` (own request + another program's)."""
+    from mdde.translate import StopRun
+
+    def worker():
+        while True:
+            try:
+                budget()
+            except StopRun:
+                return
+            time.sleep(0.005)
+            with lock:
+                server["rem"] -= cost
+                server["low"] = min(server["low"], server["rem"])
+            time.sleep(flight)
+
+    threads = [threading.Thread(target=worker) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
+@pytest.mark.parametrize("bot", [0, 1])
+def test_parallel_workers_with_a_slower_key_neither_stop_early_nor_touch_the_reserve(bot):
+    # probe W1 of review 4: /key is evaluated 30 ms after the call, a request reaches the
+    # server after 5 ms. Before the fix: start 160 stopped after 6 requests (rest 154)
+    from mdde.translate import Budget
+
+    lock, server = threading.Lock(), {"rem": 160, "low": 160}
+
+    def quota():
+        time.sleep(0.03)
+        with lock:
+            value = server["rem"]
+        time.sleep(0.03)
+        return {"limit": 1000, "remaining": value}
+
+    budget = Budget(quota, RunOptions(), None, lambda: NOON, lambda line: None)
+    budget.start()
+    run_workers(budget, server, lock, cost=1 + bot)
+    assert budget.reason == "quota"
+    # reserve 100 + 6 requests in flight with the bot's requests meanwhile
+    assert 100 <= server["low"] <= 100 + 6 * (1 + bot) + 6
+
+
 # -- review finding K2: Ctrl+C and SIGTERM stop the run quickly -------------------------
 def slow_env(tmp_path, n=300):
     def responder(payload):

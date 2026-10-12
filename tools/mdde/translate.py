@@ -42,7 +42,9 @@ Flow per run:
    never raises the local estimate (``/key`` may lag behind); after 00:00 UTC
    a jump of more than ``quota_every + workers`` above it is the daily reset.
    A failed query is retried after ``quota_every`` requests (near the end
-   after ``KEY_RETRY_EVERY``), outside the budget lock. Other programs using
+   after ``KEY_RETRY_EVERY``), outside the budget lock; the other workers wait
+   up to ``KEY_WAIT`` for its answer, so the server cannot count requests of
+   ours that look like another program's. Other programs using
    the same key between two queries can still eat into the reserve, so it is
    kept on a best-effort basis ("nach bestem Bemuehen"), not guaranteed. An
    unknown quota stops the run unless ``allow_unknown_quota`` is set;
@@ -101,6 +103,7 @@ DISCARD_WINDOW = 20
 DISCARD_TRIP = 14
 KEY_RETRY_EVERY = 5  # near the threshold: own requests between two tries after a failed /key
 KEY_FAIL_LOG_EVERY = 10  # log the first failed /key query in a row and every 10th
+KEY_WAIT = 1.0  # s other workers wait for a /key answer before they go on without it
 
 
 def load_glossary(path: Path) -> dict[str, str]:
@@ -222,10 +225,13 @@ class Budget:
     ``_lock`` serialises the accounting of requests; ``stop`` never takes it,
     so a stop request is never blocked by a worker that sleeps until the daily
     reset while holding it. A regular ``/key`` query runs *outside* the lock
-    (it may hang up to the 30 s timeout): one worker asks, the others go on
-    with the local estimate, and the answer is taken in under the lock - an
-    answer from before a reset wait (``generation``) is dropped. Only the
-    start and the queries right after a reset wait run under the lock.
+    (it may hang up to the 30 s timeout): one worker asks, the others wait up
+    to ``KEY_WAIT`` for the answer - a request passing the gate meanwhile may
+    reach the server before /key is answered and would look like another
+    program's (review 4, W1) - and then go on with the local estimate. The
+    answer is taken in under the lock - an answer from before a reset wait
+    (``generation``) is dropped. Only the start and the queries right after a
+    reset wait run under the lock.
 
     A failed query is retried after ``quota_every`` requests, within
     ``quota_every`` of the stop threshold after ``KEY_RETRY_EVERY``; the log
@@ -255,6 +261,7 @@ class Budget:
         self._stopped = threading.Event()
         self._sleep = sleep if sleep is not None else self.wait
         self._lock = threading.Lock()
+        self._answered = threading.Condition(self._lock)  # a /key answer was taken in
         self._reason_lock = threading.Lock()
         self.used = 0
         self.reason: str | None = None
@@ -265,6 +272,7 @@ class Budget:
         self._last_try = 0  # ``used`` when the last query was sent (successful or not)
         self._failures = 0  # failed queries in a row
         self._querying = False  # a worker is waiting for /key outside the lock
+        self._query_until = 0.0  # time.monotonic() until which the others wait for it
         self._own = 0  # own requests between successful queries, since the run start / reset
         self._external = 0  # external requests measured over the same intervals
         # (own, external) of the latest intervals; each has >= 1 own request
@@ -325,9 +333,11 @@ class Budget:
     def __call__(self) -> None:
         with self._lock:
             self._check_max_requests()
+            self._await_answer()
             query = not self.stopped and self._query_due()
             if query:
                 self._querying = True
+                self._query_until = time.monotonic() + KEY_WAIT
                 self._last_try = at = self.used
                 generation = self.generation
         if query:
@@ -337,6 +347,7 @@ class Budget:
             finally:
                 with self._lock:
                     self._querying = False
+                    self._answered.notify_all()
                     if generation == self.generation and not self.stopped:
                         self._take(info, at)
         with self._lock:
@@ -361,6 +372,16 @@ class Budget:
         if not self.stopped and self.opts.max_requests is not None \
                 and self.used >= self.opts.max_requests:
             self.stop("max-requests")
+
+    def _await_answer(self) -> None:  # lock held
+        """Wait up to ``KEY_WAIT`` for a /key answer on the way: a request passing the gate
+        meanwhile may reach the server before /key is answered and would then look like
+        another program's request."""
+        while self._querying and not self.stopped:
+            left = self._query_until - time.monotonic()
+            if left <= 0:
+                return
+            self._answered.wait(left)
 
     def _query_due(self) -> bool:  # lock held
         """Time for a /key query before the next request?"""
