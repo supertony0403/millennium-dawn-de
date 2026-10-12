@@ -151,8 +151,12 @@ def is_unchanged(en: str, de: str) -> bool:
     return has_text(en) and normalized(de) == normalized(en)
 
 
-def _plain_length(text: str) -> int:
+def plain_length(text: str) -> int:
+    """Length of ``text`` without tokens and with collapsed whitespace."""
     return len(" ".join(strip_tokens(text).split()))
+
+
+_plain_length = plain_length
 
 
 def length_ok(en: str, de: str) -> bool:

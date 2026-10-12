@@ -422,6 +422,62 @@ def test_package_with_several_unchanged_answers_is_kept_in_one_request(tmp_path)
     assert env.cache.get("a", "German Unity") == "Deutsche Einheit"
 
 
+# -- review 2, k-2 / k-5: length alignment and a telling discard log -----------------------
+SHORT = {  # all shorter than 40 characters: neither the length nor the neighbour rule applies
+    "Build new roads": "Neue Straßen bauen",
+    "Strengthen ties with all our neighbours": "Die Beziehungen zu allen Nachbarn stärken",
+    "Raise the taxes": "Steuern erhöhen",
+    "Invest heavily in renewable energies": "Stark in erneuerbare Energien investieren",
+    "Hold free elections": "Freie Wahlen abhalten",
+    "Modernise our whole railway network": "Das gesamte Eisenbahnnetz modernisieren",
+    "Cut the defence budget": "Den Verteidigungshaushalt kürzen",
+    "Expand the national research programme": "Das nationale Forschungsprogramm ausbauen",
+}
+
+
+def test_answers_shifted_by_one_are_found_by_their_lengths():
+    texts, good = list(SHORT), list(SHORT.values())
+    assert not Runner._suspect(texts, good)
+    assert Runner._suspect(texts, good[1:] + [None])
+    assert Runner._suspect(texts, [None] + good[:-1])
+
+
+def shifted_once(table):
+    calls = Counter()
+
+    def responder(payload):
+        batch = json.loads(payload["messages"][1]["content"])
+        texts = [batch[str(i)] for i in range(len(batch))]
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return completion({str(i): table[texts[i + 1]] for i in range(len(texts) - 1)})
+        return completion({str(i): table[en] for i, en in enumerate(texts)})
+
+    return responder
+
+
+def test_short_shifted_answers_never_reach_the_cache(tmp_path):
+    env = Env(tmp_path, responder=shifted_once(SHORT))
+    report = env.runner.run([(f"k{i}", en) for i, en in enumerate(SHORT)])
+    for i, (en, de) in enumerate(SHORT.items()):
+        assert env.cache.get(f"k{i}", en) == de
+    assert report.shifted_packages == 1
+
+
+def test_discard_log_names_reason_count_and_an_example_key(tmp_path):
+    env = Env(tmp_path, responder=shifted_once(SHIFT_TABLE))
+    env.runner.run([(f"k{i}", en) for i, en in enumerate(SHIFT_TEXTS)])
+    line = next(line for line in env.out if "verworfen" in line)
+    assert re.search(r"Grund Nachbar, \d+ Treffer, z\. B\. k\d", line), line
+
+
+def test_discard_log_names_the_length_alignment(tmp_path):
+    env = Env(tmp_path, responder=shifted_once(SHORT))
+    env.runner.run([(f"k{i}", en) for i, en in enumerate(SHORT)])
+    line = next(line for line in env.out if "verworfen" in line)
+    assert re.search(r"Grund Verschiebung, \d+ Treffer, z\. B\. k\d", line), line
+
+
 # -- review finding K1: the reserve is never undercut ---------------------------------
 class LiveQuota:
     """Transport whose daily quota really drops by one per chat request.

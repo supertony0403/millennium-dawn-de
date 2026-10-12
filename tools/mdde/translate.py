@@ -8,9 +8,11 @@ Flow per run:
    parallel; every valid answer goes to the cache immediately, answers equal
    to the English text go to the unchanged log instead (not requested again
    unless ``retry_unchanged``);
-3. a package whose answers look shifted (>= 3 length-ratio violations, or
-   >= 2 answers that fit a neighbouring text but not their own) is discarded
-   as a whole: big packages go to round two, small ones are split in halves;
+3. a package whose answers look shifted (>= 3 length-ratio violations,
+   >= 2 answers that fit a neighbouring text but not their own, or answer
+   lengths that match the neighbouring texts far better than their own) is
+   discarded as a whole - the log names the rule, the count and an example
+   key: big packages go to round two, small ones are split in halves;
 4. a package that the provider's content moderation refuses (HTTP 403 with
    moderation metadata) is split in halves until the flagged text is alone;
    that text goes straight to the reject log (reason ``moderation``), the
@@ -62,6 +64,15 @@ Regeln:
 MAX_RESET_WAITS = 3
 SUSPECT_LENGTH_VIOLATIONS = 3  # length-ratio violations that discard a package
 SUSPECT_NEIGHBOUR_FITS = 2  # answers that fit a neighbour instead of their own text
+# length alignment, calibrated on Millennium Dawn's 39,018 human pairs and the cache
+# (two run orders, packages of 10 and 100, three package boundaries): no false alarm;
+# 0.25 instead of 0.45 found more shifts but discarded 5 correct packages
+ALIGN_MIN_SOURCE = 15  # characters of both texts compared
+ALIGN_MIN_ANSWER = 5
+ALIGN_MIN_PAIRS = 4
+ALIGN_MIN_OWN_COST = 0.45  # mean |log(length ratio)| against the own texts
+ALIGN_RATIO = 0.6  # a neighbour must fit this much better
+SUSPICION_LABELS = {"length": "Laenge", "neighbour": "Nachbar", "alignment": "Verschiebung"}
 FINAL_REASONS = ("moderation",)  # rejected at once, a second round would not help
 
 
@@ -129,6 +140,46 @@ class RunReport:
     stopped: str | None = None
     quota_remaining: int | None = None
     extra: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Suspicion:
+    """Why a package looks shifted: rule, number of hits, index of one example."""
+
+    reason: str  # "length" | "neighbour" | "alignment"
+    count: int
+    index: int
+
+
+def _length_cost(texts: list[str], answers: list[object], offset: int) -> tuple[float | None, list[int]]:
+    """Mean |log(len(answer) / len(text[i + offset]))| over comparable pairs and their indices."""
+    total, used = 0.0, []
+    for i, de in enumerate(answers):
+        j = i + offset
+        if not isinstance(de, str) or not 0 <= j < len(texts):
+            continue
+        source, own, answer = validate.plain_length(texts[j]), validate.plain_length(texts[i]), validate.plain_length(de)
+        if own < ALIGN_MIN_SOURCE or source < ALIGN_MIN_SOURCE or answer < ALIGN_MIN_ANSWER:
+            continue
+        total += abs(math.log(answer / source))
+        used.append(i)
+    return (total / len(used) if len(used) >= ALIGN_MIN_PAIRS else None), used
+
+
+def misaligned(texts: list[str], answers: list[object]) -> Suspicion | None:
+    """Answer lengths fit the next (or previous) texts far better than their own."""
+    own, _ = _length_cost(texts, answers, 0)
+    if own is None or own < ALIGN_MIN_OWN_COST:
+        return None
+    for offset in (1, -1):
+        cost, used = _length_cost(texts, answers, offset)
+        if cost is None or cost >= ALIGN_RATIO * own:
+            continue
+        better = [i for i in used
+                  if abs(math.log(validate.plain_length(answers[i]) / validate.plain_length(texts[i + offset])))
+                  < abs(math.log(validate.plain_length(answers[i]) / validate.plain_length(texts[i])))]
+        return Suspicion("alignment", len(better), better[0] if better else used[0])
+    return None
 
 
 class StopRun(Exception):
@@ -365,14 +416,13 @@ class Runner:
                 self.budget.stop("auth" if isinstance(exc, AuthError) else "no-models")
 
     @staticmethod
-    def _suspect(texts: list[str], answers: list[object]) -> bool:
-        """True if the answers of a package look shifted against their ids."""
-        bad_length = sum(
-            1 for en, de in zip(texts, answers) if isinstance(de, str) and not validate.length_ok(en, de)
-        )
-        if bad_length >= SUSPECT_LENGTH_VIOLATIONS:
-            return True
-        neighbour_fits = 0
+    def _diagnose(texts: list[str], answers: list[object]) -> Suspicion | None:
+        """Why the answers of a package look shifted against their ids, if they do."""
+        bad_length = [i for i, (en, de) in enumerate(zip(texts, answers))
+                      if isinstance(de, str) and not validate.length_ok(en, de)]
+        if len(bad_length) >= SUSPECT_LENGTH_VIOLATIONS:
+            return Suspicion("length", len(bad_length), bad_length[0])
+        neighbour_fits = []
         for i, (en, de) in enumerate(zip(texts, answers)):
             if not isinstance(de, str) or validate.check(en, de) in (None, "unchanged"):
                 continue  # fits its own text (an unchanged answer is no neighbour's)
@@ -380,9 +430,16 @@ class Runner:
                 other = texts[j] if 0 <= j < len(texts) else None
                 if (other is not None and other != en and validate.distinctive(other)
                         and validate.check(other, de) is None):
-                    neighbour_fits += 1
+                    neighbour_fits.append(i)
                     break
-        return neighbour_fits >= SUSPECT_NEIGHBOUR_FITS
+        if len(neighbour_fits) >= SUSPECT_NEIGHBOUR_FITS:
+            return Suspicion("neighbour", len(neighbour_fits), neighbour_fits[0])
+        return misaligned(texts, answers)
+
+    @staticmethod
+    def _suspect(texts: list[str], answers: list[object]) -> bool:
+        """True if the answers of a package look shifted against their ids."""
+        return Runner._diagnose(texts, answers) is not None
 
     def _split(self, texts: list[str], keys: Mapping[str, list[str]]) -> dict[str, tuple]:
         mid = len(texts) // 2
@@ -404,10 +461,13 @@ class Runner:
         if not result.ok:
             return {en: ("batch", None, None) for en in texts}
         answers = [result.texts.get(str(i)) for i in range(len(texts))]
-        if len(texts) > 1 and self._suspect(texts, answers):
+        suspicion = self._diagnose(texts, answers) if len(texts) > 1 else None
+        if suspicion is not None:
             with self._stats_lock:
                 self.report.shifted_packages += 1
-            self.log(f"Paket mit {len(texts)} Texten verworfen ({result.model}): Antworten wirken verschoben")
+            self.log(f"Paket mit {len(texts)} Texten verworfen ({result.model}): Antworten wirken verschoben "
+                     f"- Grund {SUSPICION_LABELS[suspicion.reason]}, {suspicion.count} Treffer, "
+                     f"z. B. {keys[texts[suspicion.index]][0]}")
             if len(texts) > self.opts.retry_items:
                 return {en: ("shifted", result.model, None) for en in texts}
             return self._split(texts, keys)
