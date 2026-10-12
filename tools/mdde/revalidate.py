@@ -59,6 +59,17 @@ def _record(line: str) -> dict | None:
     return None
 
 
+def spread(items: list, n: int) -> list:
+    """``n`` items evenly spread over ``items`` (first and last included)."""
+    if n <= 0:
+        return []
+    if len(items) <= n:
+        return list(items)
+    if n == 1:
+        return [items[0]]
+    return [items[round(i * (len(items) - 1) / (n - 1))] for i in range(n)]
+
+
 def _backup_path(path: Path, now: datetime) -> Path:
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
     candidate = path.with_name(f"{path.name}.bak-{stamp}")
@@ -89,6 +100,7 @@ def revalidate(md_root: Path, cache_path: Path, rejects: RejectLog, unchanged: U
     index = english_index(md_root)
     keep: list[int] = []
     moves: list[tuple[str, dict, str]] = []
+    found: dict[str, list[tuple[str, str, str]]] = {}
     for (key, sha), i in latest.items():
         rec = records[i]
         assert rec is not None
@@ -104,10 +116,9 @@ def revalidate(md_root: Path, cache_path: Path, rejects: RejectLog, unchanged: U
             keep.append(i)
             continue
         report.by_reason[reason] += 1
-        shown = report.examples.setdefault(reason, [])
-        if len(shown) < examples:
-            shown.append((key, en, rec["de"]))
+        found.setdefault(reason, []).append((key, en, rec["de"]))
         moves.append((reason, rec, en))
+    report.examples = {reason: spread(items, examples) for reason, items in found.items()}
 
     if apply and cache_path.exists():
         report.backup = _backup_path(cache_path, now or datetime.now(timezone.utc))

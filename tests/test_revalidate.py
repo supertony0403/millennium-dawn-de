@@ -91,3 +91,16 @@ def test_cli_revalidate_apply_respects_the_run_lock(md_root, cache_dir, monkeypa
     with run_lock(cache_dir / "translate.lock"):
         assert main(["revalidate", "--apply"]) == 1
     assert (cache_dir / "translations.jsonl").read_bytes() == before
+
+
+def test_examples_are_spread_over_the_whole_group(md_root, tmp_path):
+    pairs = [("GER_focus_unity", "German Unity"), ("GER_focus_unity_desc", "We must unite."),
+             ("GER_focus_new", "Brand New Focus"), ("CAN_focus_maple", "Maple Leaf Forever"),
+             ("RUS_event_title", "Russian Troubles"), ("GER_event_title", "German Troubles"),
+             ("USA.conservatism", "American Conservatism")]
+    path = tmp_path / "translations.jsonl"
+    path.write_text("".join(record(k, en, en) + "\n" for k, en in pairs), encoding="utf-8")
+    report = revalidate(md_root, path, RejectLog(tmp_path / "r.jsonl"), UnchangedLog(tmp_path / "u.jsonl"),
+                        examples=3)
+    assert [k for k, _, _ in report.examples["unchanged"]] == ["GER_focus_unity", "CAN_focus_maple",
+                                                                 "USA.conservatism"]

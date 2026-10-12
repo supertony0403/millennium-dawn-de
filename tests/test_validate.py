@@ -174,6 +174,9 @@ def test_length_ratio_ignores_tokens():
             "IT security and AT weapons for the army of the future",
             "IT-Sicherheit und AT-Waffen für die Armee der Zukunft, Typ A",
         ),
+        # short title without German stop words: only skipping acronyms keeps it valid
+        ("Leopard 2A4M CAN Main Battle Tank", "Kampfpanzer Leopard 2A4M CAN"),
+        ("IT and AT Systems", "IT AT Systeme"),
         # German text that keeps an English designer hint (real Millennium Dawn value)
         (
             "The addition of integrated health monitoring systems has allowed predictive maintenance."
