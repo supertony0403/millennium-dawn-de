@@ -69,9 +69,10 @@ Lange Übersetzungsläufe vor dem Standby schützen:
    (HTTP 403 mit Moderationsdaten), wird zuerst das nächste Modell der Kette gefragt; sperren
    alle, wird das Paket höchstens zweimal je Runde halbiert – was dann noch gesperrt ist, geht
    in Runde zwei bzw. danach einzeln mit Grund `moderation` in die Ablehnungen (auch
-   unschuldige Nachbartexte; `--retry-rejects` holt sie zurück). Notschalter: Werden mehr als
-   5 der letzten 10 Pakete verworfen, wird das Modell für den Lauf gesperrt; passiert das
-   erneut (oder gibt es kein weiteres Modell), stoppt der Lauf mit Exit-Code 1.
+   unschuldige Nachbartexte; `--retry-rejects` holt sie zurück). Notschalter: Werden 14 der
+   letzten 20 Pakete verworfen, wird das Modell für den Lauf gesperrt; passiert das
+   erneut (oder gibt es kein weiteres Modell), stoppt der Lauf mit Exit-Code 1. Pakete, die
+   nur wegen zurückgegebenem Englisch (verschobenes Echo) verworfen werden, zählen dabei nicht.
    Das Tageskontingent wird alle 10 Anfragen abgefragt und dazwischen lokal
    heruntergezählt, nahe der Reserve vor jeder Anfrage; der Lauf stoppt, bevor die Reserve
    angetastet wird – nach bestem Bemühen: Was andere Programme mit demselben Schlüssel

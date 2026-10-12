@@ -24,10 +24,12 @@ Flow per run:
    one by one to the reject log (round two). The model stays in the chain;
    round two: invalid or failed texts again in packages of 10; texts that are
    still invalid go to the reject log (the English text stays in the game);
-   emergency switch: when more than half of the last ``DISCARD_WINDOW``
-   packages were discarded as shifted, the model is dropped for the run; if
-   it happens again (or no other model is left) the run stops (``discards``,
-   exit code 1);
+   emergency switch: when ``DISCARD_TRIP`` (14) of the last ``DISCARD_WINDOW``
+   (20) packages were discarded as shifted, the model is dropped for the run;
+   if it happens again (or no other model is left) the run stops
+   (``discards``, exit code 1). A package that only looks shifted because of
+   echoed English texts (answers equal to texts of the package) is discarded
+   but never counts for the switch - an echo is an unchanged answer;
 5. a budget (``Budget``) guards every request: ``--max-requests`` and the
    free daily quota. The quota is queried at the start and every 10 requests
    and counted down locally in between; within ``quota_every`` of
@@ -86,7 +88,11 @@ ALIGN_RATIO = 0.6  # a neighbour must fit this much better
 SUSPICION_LABELS = {"length": "Laenge", "neighbour": "Nachbar", "alignment": "Verschiebung"}
 FINAL_REASONS = ("moderation",)  # rejected at once, a second round would not help
 MAX_SPLIT_DEPTH = 2  # halving levels per round for a package refused by moderation
-DISCARD_WINDOW = 10  # emergency switch: more than half of these packages discarded
+# emergency switch: DISCARD_TRIP of the last DISCARD_WINDOW packages discarded. Review 3:
+# no false trip up to a 20 % discard rate (the live run saw 10.7 %), a model that shifts
+# every package is still dropped after 14 packages
+DISCARD_WINDOW = 20
+DISCARD_TRIP = 14
 
 
 def load_glossary(path: Path) -> dict[str, str]:
@@ -453,6 +459,13 @@ class Runner:
         return misaligned(texts, answers)
 
     @staticmethod
+    def _without_echoes(texts: list[str], answers: list[object]) -> list[object]:
+        """``answers`` with English echoes (equal to any text of the package) left out."""
+        english = {validate.normalized(en) for en in texts if validate.has_text(en)}
+        return [None if isinstance(de, str) and validate.normalized(de) in english else de
+                for de in answers]
+
+    @staticmethod
     def _suspect(texts: list[str], answers: list[object]) -> bool:
         """True if the answers of a package look shifted against their ids."""
         return Runner._diagnose(texts, answers) is not None
@@ -471,7 +484,7 @@ class Runner:
                 return  # late answers of a model the switch already dropped
             self._recent.append(discarded)
             bad = sum(self._recent)
-            if bad * 2 <= DISCARD_WINDOW or self.budget.stopped:
+            if bad < DISCARD_TRIP or self.budget.stopped:
                 return
             self._recent.clear()
             self._trips += 1
@@ -513,13 +526,16 @@ class Runner:
         answers = [validate.repair_escapes(en, de) for en, de in zip(texts, raw)]
         repaired = sum(1 for a, b in zip(raw, answers) if a is not b)
         suspicion = self._diagnose(texts, answers) if len(texts) > 1 else None
-        self._note_package(result.model, suspicion is not None)
+        # shifted echoes of the English texts are unchanged answers, no broken model
+        echo = suspicion is not None and self._diagnose(texts, self._without_echoes(texts, answers)) is None
+        self._note_package(result.model, suspicion is not None and not echo)
         if suspicion is not None:
             with self._stats_lock:
                 self.report.shifted_packages += 1
             self.log(f"Paket mit {len(texts)} Texten verworfen ({result.model}): Antworten wirken verschoben "
                      f"- Grund {SUSPICION_LABELS[suspicion.reason]}, {suspicion.count} Treffer, "
-                     f"z. B. {keys[texts[suspicion.index]][0]}")
+                     f"z. B. {keys[texts[suspicion.index]][0]}"
+                     + (" (Echo des Englischen, zaehlt nicht fuer den Notschalter)" if echo else ""))
             if len(texts) > self.opts.retry_items:
                 return {en: ("shifted", result.model, None) for en in texts}
             return self._split(texts, keys, final, avoid, depth)

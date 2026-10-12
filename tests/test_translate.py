@@ -592,14 +592,21 @@ def good_german(batch):
             for i, en in batch.items()}
 
 
-def test_emergency_switch_changes_the_model_after_six_of_ten_discards(tmp_path):
+def test_emergency_switch_window_is_twenty_packages_and_trips_at_fourteen():
+    # review 3, K2: 6 of 10 tripped too easily at the real discard rate of 10.7 %
+    from mdde.translate import DISCARD_TRIP, DISCARD_WINDOW
+
+    assert (DISCARD_WINDOW, DISCARD_TRIP) == (20, 14)
+
+
+def test_emergency_switch_changes_the_model_after_fourteen_discards(tmp_path):
     runner, cache, calls = two_models(tmp_path, truncating, good_german, batch_items=12)
     log = []
     runner._out = log.append
-    report = runner.run(long_texts(72))
+    report = runner.run(long_texts(12 * 20))
     assert runner.client.disabled == {"m1"}
-    assert [m for m, _ in calls].count("m1") == 6
-    assert report.translated == 72 and report.rejected == 0 and report.stopped is None
+    assert [m for m, _ in calls].count("m1") == 14
+    assert report.translated == 240 and report.rejected == 0 and report.stopped is None
     assert any("Notschalter" in line and "m1" in line for line in log)
 
 
@@ -607,29 +614,61 @@ def test_emergency_switch_stops_the_run_when_it_trips_again(tmp_path):
     runner, cache, calls = two_models(tmp_path, truncating, truncating, batch_items=12)
     log = []
     runner._out = log.append
-    report = runner.run(long_texts(120))
+    report = runner.run(long_texts(12 * 30))
     assert report.stopped == "discards"
-    assert len(calls) <= 6 + 6
+    assert len(calls) == 14 + 14
     assert any("Notschalter" in line and "gestoppt" in line for line in log)
 
 
 def test_emergency_switch_stops_at_once_without_another_model(tmp_path):
     env = Env(tmp_path, responder=lambda p: completion(truncating(json.loads(p["messages"][1]["content"]))),
               batch_items=12)
-    report = env.runner.run(long_texts(120))
+    report = env.runner.run(long_texts(12 * 20))
     assert report.stopped == "discards"
-    assert len(env.chat_calls) == 6
+    assert len(env.chat_calls) == 14
+
+
+def test_emergency_switch_needs_fourteen_of_the_last_twenty_packages(tmp_path):
+    runner, cache, calls = two_models(tmp_path, truncating, good_german)
+    for discarded in [False] * 7 + [True] * 13:
+        runner._note_package("m1", discarded)
+    assert runner.client.disabled == set()  # 13 of 20
+    runner._note_package("m1", True)  # the oldest (kept) package leaves the window: 14 of 20
+    assert runner.client.disabled == {"m1"}
 
 
 def test_late_answers_of_a_dropped_model_do_not_trip_the_switch_again(tmp_path):
     runner, cache, calls = two_models(tmp_path, truncating, good_german)
-    for _ in range(6):
+    for _ in range(14):
         runner._note_package("m1", True)
     assert runner.client.disabled == {"m1"}
     for _ in range(5):  # still on the wire when m1 was dropped (6 workers)
         runner._note_package("m1", True)
     runner._note_package("m2", True)
     assert not runner.budget.stopped
+
+
+def shifted_echo(payload):
+    """A model that returns the English texts, shifted by one id (it skipped the first)."""
+    batch = json.loads(payload["messages"][1]["content"])
+    return completion({str(j): batch[str(j + 1)] for j in range(len(batch) - 1)})
+
+
+def mixed_lengths(n):
+    return [(f"k{i}", f"Short english text {i}" if i % 2 else
+             f"A much longer english sentence number {i} about the reform of the national economy")
+            for i in range(n)]
+
+
+def test_discarded_packages_of_echoed_english_never_trip_the_emergency_switch(tmp_path):
+    # review 3, K2: an echo is an unchanged answer, not a model that shifts translations
+    env = Env(tmp_path, responder=shifted_echo, batch_items=12)
+    report = env.runner.run(mixed_lengths(12 * 20))
+    assert report.shifted_packages >= 20  # every package was discarded ...
+    assert report.stopped is None  # ... but none of them counted for the switch
+    assert env.client.disabled == set()
+    log = (tmp_path / "logs" / "translate.log").read_text()
+    assert "Echo" in log and "Notschalter:" not in log
 
 
 def test_discard_stop_is_a_fatal_exit():
