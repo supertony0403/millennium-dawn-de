@@ -64,9 +64,14 @@ Lange Übersetzungsläufe vor dem Standby schützen:
    „Maghreb“, „Opposition“) gehen direkt dorthin. Ungültige Texte bekommen eine zweite Runde
    in kleinen Paketen, danach landen sie in `cache/rejects.jsonl` (im Spiel bleibt dann der
    englische Text stehen). Ein Paket, dessen Antworten verschoben wirken, wird ganz
-   verworfen und kleiner wiederholt; sperrt die Inhaltsmoderation des Anbieters ein Paket
-   (HTTP 403 mit Moderationsdaten), wird es geteilt, bis der eine Text isoliert ist – der
-   kommt mit Grund `moderation` in die Ablehnungen, das Modell bleibt in der Kette.
+   verworfen und kleiner wiederholt; das Log nennt Regel (Länge/Nachbar/Verschiebung),
+   Trefferzahl und einen Beispiel-Schlüssel. Sperrt die Inhaltsmoderation ein Paket
+   (HTTP 403 mit Moderationsdaten), wird zuerst das nächste Modell der Kette gefragt; sperren
+   alle, wird das Paket höchstens zweimal je Runde halbiert – was dann noch gesperrt ist, geht
+   in Runde zwei bzw. danach einzeln mit Grund `moderation` in die Ablehnungen (auch
+   unschuldige Nachbartexte; `--retry-rejects` holt sie zurück). Notschalter: Werden mehr als
+   5 der letzten 10 Pakete verworfen, wird das Modell für den Lauf gesperrt; passiert das
+   erneut (oder gibt es kein weiteres Modell), stoppt der Lauf mit Exit-Code 1.
    Das Tageskontingent wird alle 10 Anfragen abgefragt und dazwischen lokal
    heruntergezählt, nahe der Reserve vor jeder Anfrage; der Lauf stoppt, bevor die Reserve
    angetastet wird – nach bestem Bemühen: Was andere Programme mit demselben Schlüssel
@@ -107,7 +112,7 @@ Nach einem Update von Millennium Dawn: `status` → `translate` → `build` → 
 Exit-Codes: `check` 0 = in Ordnung, 1 = Fehler in der Ausgabe, 2 = Build veraltet
 (Millennium Dawn hat sich seit dem letzten `build` geändert). `translate` endet mit 1 bei
 Schlüssel-/Modellfehlern (auch: nur noch dauerhaft rate-limitierte Modelle), unbekanntem
-Kontingent oder wenn schon ein Lauf aktiv ist, mit 130 nach Strg+C/SIGTERM; ein Stopp wegen
+Kontingent, Notschalter (zu viele verworfene Pakete) oder wenn schon ein Lauf aktiv ist, mit 130 nach Strg+C/SIGTERM; ein Stopp wegen
 der Reserve oder `--max-requests` ist kein Fehler.
 
 ## Dateien

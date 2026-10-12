@@ -552,6 +552,81 @@ def test_retry_unchanged_can_be_limited_to_translatable_texts(tmp_path, mode, ex
     assert sorted(en for _, batch in calls for en in batch) == expected
 
 
+# -- review 2, k-1: bounded split costs and an emergency switch -----------------------------
+def moderating(flagged):
+    def respond(payload):
+        batch = json.loads(payload["messages"][1]["content"])
+        if any(f in batch.values() for f in flagged):
+            return 403, json.dumps({"error": {"code": 403, "message": "flagged",
+                                              "metadata": {"reasons": ["violence"]}}}).encode()
+        return completion({i: f"Satz {en}" for i, en in batch.items()})
+    return respond
+
+
+def test_moderation_splits_at_most_two_levels_per_round(tmp_path):
+    flagged = "Harmless english sentence number 37"
+    units = [(f"k{i}", flagged if i == 37 else f"Unique english sentence number {i}") for i in range(100)]
+    env = Env(tmp_path, responder=moderating([flagged]), batch_items=100)
+    report = env.runner.run(units)
+    # round 1: 100 -> 50 -> 25 (stop, before the fix: down to 1 = 15 requests);
+    # round 2: the 25 in tens -> 10 -> 5 -> 3 (stop, these 3 are rejected)
+    assert len(env.chat_calls) == 1 + 2 + 2 + 3 + 2 + 2
+    assert report.translated == 97
+    assert report.rejected == 3
+    records = [json.loads(line) for line in (tmp_path / "cache" / "rejects.jsonl").read_text().splitlines()]
+    assert {r["reason"] for r in records} == {"moderation"}
+    assert any(r["en"] == flagged for r in records)
+
+
+def long_texts(n):
+    return [(f"k{i}", f"The long english sentence number {i} about the reform of the national economy")
+            for i in range(n)]
+
+
+def truncating(batch):
+    return {i: "Kurz" for i in batch}
+
+
+def good_german(batch):
+    return {i: f"Der lange deutsche Satz Nummer {en.split()[4]} über die Reform der Volkswirtschaft"
+            for i, en in batch.items()}
+
+
+def test_emergency_switch_changes_the_model_after_six_of_ten_discards(tmp_path):
+    runner, cache, calls = two_models(tmp_path, truncating, good_german, batch_items=12)
+    log = []
+    runner._out = log.append
+    report = runner.run(long_texts(72))
+    assert runner.client.disabled == {"m1"}
+    assert [m for m, _ in calls].count("m1") == 6
+    assert report.translated == 72 and report.rejected == 0 and report.stopped is None
+    assert any("Notschalter" in line and "m1" in line for line in log)
+
+
+def test_emergency_switch_stops_the_run_when_it_trips_again(tmp_path):
+    runner, cache, calls = two_models(tmp_path, truncating, truncating, batch_items=12)
+    log = []
+    runner._out = log.append
+    report = runner.run(long_texts(120))
+    assert report.stopped == "discards"
+    assert len(calls) <= 6 + 6
+    assert any("Notschalter" in line and "gestoppt" in line for line in log)
+
+
+def test_emergency_switch_stops_at_once_without_another_model(tmp_path):
+    env = Env(tmp_path, responder=lambda p: completion(truncating(json.loads(p["messages"][1]["content"]))),
+              batch_items=12)
+    report = env.runner.run(long_texts(120))
+    assert report.stopped == "discards"
+    assert len(env.chat_calls) == 6
+
+
+def test_discard_stop_is_a_fatal_exit():
+    from mdde.cli import FATAL_STOPS
+
+    assert "discards" in FATAL_STOPS
+
+
 # -- review finding K1: the reserve is never undercut ---------------------------------
 class LiveQuota:
     """Transport whose daily quota really drops by one per chat request.
@@ -804,7 +879,8 @@ def test_moderated_text_is_isolated_and_rejected_without_blocking_the_model(tmp_
     assert env.client.disabled == set()
     record = json.loads((tmp_path / "cache" / "rejects.jsonl").read_text().splitlines()[0])
     assert (record["key"], record["reason"]) == ("morocco.400.d", "moderation")
-    assert sum(1 for c in env.chat_calls if flagged in c.body["messages"][1]["content"]) == 4  # 10, 5, 3, 1 - no round two
+    # round 1: 10, 5, 2 (two halvings, then on to round two); round 2: 2, 1 (isolated, rejected)
+    assert sum(1 for c in env.chat_calls if flagged in c.body["messages"][1]["content"]) == 5
     assert report.stopped is None
 
 

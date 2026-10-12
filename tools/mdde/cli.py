@@ -22,7 +22,7 @@ from .translate import (
     sigterm_as_interrupt,
 )
 
-FATAL_STOPS = {"auth", "no-models", "error", "quota-unknown"}
+FATAL_STOPS = {"auth", "no-models", "error", "quota-unknown", "discards"}
 EXIT_INTERRUPTED = 130
 
 

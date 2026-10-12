@@ -8,8 +8,9 @@ Error handling (spec "Fehlerbehandlung"):
   -> ``NoModelAvailable``.
 * 429 "free-models-per-day" -> ``QuotaExhausted`` (daily account limit).
 * 403 with moderation metadata (``error.metadata.reasons`` /
-  ``flagged_input``) -> the *input* was flagged: the batch fails with
-  ``BatchResult.moderated`` and the model stays in the chain.
+  ``flagged_input``) -> the *input* was flagged: the next model of the chain
+  is tried; only if no model answers, the batch fails with
+  ``BatchResult.moderated``. The model stays in the chain.
 * other 403/404 -> drop the model for the rest of the run.
 * 401/402 -> ``AuthError`` (nothing to retry).
 * timeout, network error, 5xx, other HTTP codes, unusable body -> next model;
@@ -182,6 +183,11 @@ class Client:
         self.quota_fields: list[str] = []  # field names of the last /key answer (no values)
         self._lock = threading.Lock()
 
+    def disable(self, model: str) -> None:
+        """Drop ``model`` from the chain for the rest of the run."""
+        with self._lock:
+            self.disabled.add(model)
+
     def __repr__(self) -> str:
         return f"Client(models={self.models!r}, disabled={sorted(self.disabled)!r})"
 
@@ -288,14 +294,17 @@ class Client:
             if not chain:
                 raise NoModelAvailable("alle Modelle der Kette sind gesperrt (403/404)")
             transient = rate_limited = False
+            moderated_by: str | None = None
             for model in chain:
                 outcome = self._attempt(model, batch)
                 if isinstance(outcome, BatchResult):
                     return outcome
                 if outcome == _MODERATED:
-                    return BatchResult(model=model, moderated=True)
+                    moderated_by = moderated_by or model  # another provider may accept it
                 transient |= outcome == _TRANSIENT
                 rate_limited |= outcome == _RATE_LIMITED
+            if moderated_by is not None:
+                return BatchResult(model=moderated_by, moderated=True)
             if transient:
                 fail_rounds += 1
                 if fail_rounds >= self.max_rounds:

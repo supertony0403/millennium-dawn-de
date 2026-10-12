@@ -278,20 +278,30 @@ def moderation(flagged="suicide bombers"):
 
 
 def test_moderation_403_fails_the_batch_but_keeps_the_model():
-    transport = FakeTransport([moderation(), completion(GOOD)])
+    transport = FakeTransport([moderation(), moderation(), completion(GOOD)])
     client = make_client(transport)
     first = client.translate_batch(BATCH)
     assert not first.ok and first.moderated and first.model == M1
     assert client.disabled == set()
     second = client.translate_batch(BATCH)
     assert second.ok and second.model == M1
-    assert [c.model for c in transport.calls] == [M1, M1]
+    assert [c.model for c in transport.calls] == [M1, M2, M1]
+
+
+def test_moderation_tries_the_next_model_first():
+    # review 2, k-1: another provider may accept the text - no split needed
+    transport = FakeTransport([moderation(), completion(GOOD)])
+    client = make_client(transport)
+    result = client.translate_batch(BATCH)
+    assert result.ok and result.model == M2
+    assert [c.model for c in transport.calls] == [M1, M2]
+    assert client.disabled == set()
 
 
 @pytest.mark.parametrize("metadata", [{"reasons": ["hate"]}, {"flagged_input": "x"}])
 def test_moderation_is_recognised_by_either_field(metadata):
     body = json.dumps({"error": {"code": 403, "message": "flagged", "metadata": metadata}}).encode()
-    result = make_client(FakeTransport([(403, body)])).translate_batch(BATCH)
+    result = make_client(FakeTransport([(403, body)]), models=(M1,)).translate_batch(BATCH)
     assert result.moderated
 
 

@@ -16,12 +16,18 @@ Flow per run:
    lengths that match the neighbouring texts far better than their own) is
    discarded as a whole - the log names the rule, the count and an example
    key: big packages go to round two, small ones are split in halves;
-4. a package that the provider's content moderation refuses (HTTP 403 with
-   moderation metadata) is split in halves until the flagged text is alone;
-   that text goes straight to the reject log (reason ``moderation``), the
-   model stays in the chain;
+4. a package that the content moderation of every model refuses (HTTP 403
+   with moderation metadata; the client tries the next model first) is split
+   in halves, at most ``MAX_SPLIT_DEPTH`` levels per round: a text found alone
+   goes straight to the reject log (reason ``moderation``); the texts of a
+   package still refused at the deepest level go to round two (round one) or
+   one by one to the reject log (round two). The model stays in the chain;
    round two: invalid or failed texts again in packages of 10; texts that are
    still invalid go to the reject log (the English text stays in the game);
+   emergency switch: when more than half of the last ``DISCARD_WINDOW``
+   packages were discarded as shifted, the model is dropped for the run; if
+   it happens again (or no other model is left) the run stops (``discards``,
+   exit code 1);
 5. a budget (``Budget``) guards every request: ``--max-requests`` and the
    free daily quota. The quota is queried at the start and every 10 requests
    and counted down locally in between; within ``quota_every`` of
@@ -43,6 +49,7 @@ import math
 import signal
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -77,6 +84,8 @@ ALIGN_MIN_OWN_COST = 0.45  # mean |log(length ratio)| against the own texts
 ALIGN_RATIO = 0.6  # a neighbour must fit this much better
 SUSPICION_LABELS = {"length": "Laenge", "neighbour": "Nachbar", "alignment": "Verschiebung"}
 FINAL_REASONS = ("moderation",)  # rejected at once, a second round would not help
+MAX_SPLIT_DEPTH = 2  # halving levels per round for a package refused by moderation
+DISCARD_WINDOW = 10  # emergency switch: more than half of these packages discarded
 
 
 def load_glossary(path: Path) -> dict[str, str]:
@@ -391,6 +400,8 @@ class Runner:
         if client.sleep is time.sleep:  # real waits for rate limits end on stop
             client.sleep = self.budget.wait
         self.report = RunReport()
+        self._recent: deque[bool] = deque(maxlen=DISCARD_WINDOW)  # discarded?, per package
+        self._trips = 0
 
     # -- logging -------------------------------------------------------------
     def log(self, line: str) -> None:
@@ -446,14 +457,34 @@ class Runner:
         return Runner._diagnose(texts, answers) is not None
 
     def _split(self, texts: list[str], keys: Mapping[str, list[str]], final: bool,
-               avoid: str | None) -> dict[str, tuple]:
+               avoid: str | None, depth: int) -> dict[str, tuple]:
         mid = len(texts) // 2
-        failures = self._process(texts[:mid], keys, final, avoid)
-        failures.update(self._process(texts[mid:], keys, final, avoid))
+        failures = self._process(texts[:mid], keys, final, avoid, depth + 1)
+        failures.update(self._process(texts[mid:], keys, final, avoid, depth + 1))
         return failures
 
+    def _note_package(self, model: str | None, discarded: bool) -> None:
+        """Emergency switch: too many discarded packages -> next model, then stop."""
+        with self._stats_lock:
+            self._recent.append(discarded)
+            bad = sum(self._recent)
+            if bad * 2 <= DISCARD_WINDOW or self.budget.stopped:
+                return
+            self._recent.clear()
+            self._trips += 1
+            others = [m for m in self.client.models if m not in self.client.disabled and m != model]
+            if self._trips == 1 and model is not None and others:
+                self.client.disable(model)
+                self.log(f"Notschalter: {bad} der letzten {DISCARD_WINDOW} Pakete verworfen ({model}) - "
+                         f"Modell fuer diesen Lauf gesperrt, weiter mit {others[0]}")
+                return
+        self.log(f"Notschalter: {bad} der letzten {DISCARD_WINDOW} Pakete verworfen ({model}) - "
+                 + ("erneut, " if self._trips > 1 else "kein anderes Modell, ")
+                 + "Lauf gestoppt. Modellkette und Antworten pruefen (logs/translate.log).")
+        self.budget.stop("discards")
+
     def _process(self, texts: list[str], keys: Mapping[str, list[str]], final: bool = False,
-                 avoid: str | None = None) -> dict[str, tuple]:
+                 avoid: str | None = None, depth: int = 0) -> dict[str, tuple]:
         """Translate one package; returns ``{en: (reason, model, de)}`` for failures.
 
         ``final`` is the last round: an unchanged answer always goes to the
@@ -466,14 +497,20 @@ class Runner:
             if len(texts) == 1:
                 self.log(f"Moderation ({result.model}) sperrt einen Text - kommt in die Ablehnungen")
                 return {texts[0]: ("moderation", result.model, None)}
+            if depth >= MAX_SPLIT_DEPTH:
+                self.log(f"Moderation ({result.model}) sperrt ein Paket mit {len(texts)} Texten nach "
+                         f"{depth} Teilungen - " + ("Texte kommen einzeln in die Ablehnungen" if final
+                                                     else "weiter in Runde zwei"))
+                return {en: ("moderation-group", result.model, None) for en in texts}
             self.log(f"Moderation ({result.model}) sperrt ein Paket mit {len(texts)} Texten - teile auf")
-            return self._split(texts, keys, final, avoid)
+            return self._split(texts, keys, final, avoid, depth)
         if not result.ok:
             return {en: ("batch", None, None) for en in texts}
         raw = [result.texts.get(str(i)) for i in range(len(texts))]
         answers = [validate.repair_escapes(en, de) for en, de in zip(texts, raw)]
         repaired = sum(1 for a, b in zip(raw, answers) if a is not b)
         suspicion = self._diagnose(texts, answers) if len(texts) > 1 else None
+        self._note_package(result.model, suspicion is not None)
         if suspicion is not None:
             with self._stats_lock:
                 self.report.shifted_packages += 1
@@ -482,7 +519,7 @@ class Runner:
                      f"z. B. {keys[texts[suspicion.index]][0]}")
             if len(texts) > self.opts.retry_items:
                 return {en: ("shifted", result.model, None) for en in texts}
-            return self._split(texts, keys, final, avoid)
+            return self._split(texts, keys, final, avoid, depth)
         if repaired:
             with self._stats_lock:
                 self.report.repaired_escapes += repaired
@@ -600,6 +637,7 @@ class Runner:
 
     def _reject(self, failures: Mapping[str, tuple], keys: Mapping[str, list[str]]) -> None:
         for en, (reason, model, de) in failures.items():
+            reason = "moderation" if reason == "moderation-group" else reason
             for key in keys[en]:
                 self.rejects.add(key, en, reason, model=model, de=de)
             self.report.rejected += len(keys[en])
