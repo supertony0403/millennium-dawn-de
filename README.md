@@ -40,6 +40,8 @@ python3 -m mdde translate --wait-for-reset          # bei leerem Kontingent bis 
 python3 -m mdde translate --retry-unchanged         # unveränderte Antworten erneut anfragen
 python3 -m mdde revalidate               # Cache mit dem aktuellen Validator prüfen (Probelauf)
 python3 -m mdde revalidate --apply       # … und bereinigen (vorher Backup)
+python3 -m mdde revalidate --repair-rejects          # doppelt escapte \\n in rejects.jsonl reparieren (Probelauf)
+python3 -m mdde revalidate --repair-rejects --apply  # … und gültige in den Cache übernehmen (vorher Backup)
 python3 -m mdde build                    # erzeugt localisation/german/** + build_info.json
 python3 -m mdde check                    # prüft die Ausgabe (Exit 0 ok, 1 Fehler, 2 veraltet)
 python3 -m mdde install --yes            # trägt den Submod im Launcher ein
@@ -73,6 +75,11 @@ Lange Übersetzungsläufe vor dem Standby schützen:
    Grund; `--apply` legt `translations.jsonl.bak-<UTC-Zeit>` an, schreibt den bereinigten
    Cache und verschiebt ungültige Einträge nach `rejects.jsonl`, unveränderte nach
    `unchanged.jsonl`. Nur ohne laufenden `translate` ausführen.
+   Antworten mit doppelt escapten Backslashes (`\\n` statt `\n`, `\\"` statt `\"`) repariert
+   `translate` vor der Prüfung selbst; ältere solche Ablehnungen holt
+   `revalidate --repair-rejects` offline aus `rejects.jsonl` (Standard Probelauf, `--apply`
+   hängt die gültigen nach einem Backup an den Cache an; der Cache hat Vorrang vor
+   `rejects.jsonl`).
 4. `build` – spiegelt **jede** deutsche Datei von Millennium Dawn unter exakt demselben
    relativen Pfad (inkl. `replace/`) und ersetzt nur offene Werte durch die Übersetzung.
    Englische Dateien ohne deutsches Gegenstück werden als neue `_l_german.yml` angelegt,

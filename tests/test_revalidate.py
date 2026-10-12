@@ -104,3 +104,76 @@ def test_examples_are_spread_over_the_whole_group(md_root, tmp_path):
                         examples=3)
     assert [k for k, _, _ in report.examples["unchanged"]] == ["GER_focus_unity", "CAN_focus_maple",
                                                                  "USA.conservatism"]
+
+
+# -- review 2, W-3: repair doubly escaped answers from rejects.jsonl offline --------------
+from mdde.revalidate import repair_rejects  # noqa: E402
+
+
+def reject(key, en, reason, de, model="m1"):
+    return json.dumps({"key": key, "src_sha1": src_hash(en), "en": en, "reason": reason, "model": model,
+                       "de": de, "ts": "x"}, ensure_ascii=False)
+
+
+@pytest.fixture
+def reject_dir(tmp_path):
+    path = tmp_path / "cache"
+    path.mkdir()
+    lines = [
+        reject("a", "Line one\\nLine two", "backslash", "Zeile eins\\\\nZeile zwei"),  # repairable
+        reject("b", 'Say \\"no\\"', "backslash", 'Sag \\\\"nein\\\\"'),  # repairable
+        reject("c", "Brand New Focus", "backslash", "Brandneuer \\„Fokus“"),  # stays invalid
+        reject("d", "German Unity", "chatter", "Hier ist die Übersetzung: Deutsche Einheit"),  # other reason
+        reject("e", "Gone\\nNow", "backslash", None),  # no answer kept
+        reject("f", "Done\\nAlready", "backslash", "Fertig\\\\nSchon"),  # translated since
+        "{kaputt",
+    ]
+    (path / "rejects.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (path / "translations.jsonl").write_text(record("f", "Done\\nAlready", "Erledigt\\nBereits") + "\n",
+                                             encoding="utf-8")
+    return path
+
+
+def repair(path, apply):
+    return repair_rejects(path / "rejects.jsonl", path / "translations.jsonl", apply=apply)
+
+
+def test_repair_rejects_dry_run_counts_and_writes_nothing(reject_dir):
+    before = {p.name: p.read_bytes() for p in reject_dir.iterdir()}
+    report = repair(reject_dir, apply=False)
+    assert report.candidates == 5
+    assert report.repaired == 2
+    assert report.still_invalid == {"backslash": 1}
+    assert report.without_answer == 1
+    assert report.already_cached == 1
+    assert [key for key, _, _ in report.examples] == ["a", "b"]
+    assert report.backup is None
+    assert {p.name: p.read_bytes() for p in reject_dir.iterdir()} == before
+
+
+def test_repair_rejects_apply_adds_valid_ones_to_the_cache_with_backup(reject_dir):
+    before = (reject_dir / "translations.jsonl").read_bytes()
+    rejects_before = (reject_dir / "rejects.jsonl").read_bytes()
+    report = repair(reject_dir, apply=True)
+    assert report.backup is not None and report.backup.read_bytes() == before
+    cache = TranslationCache(reject_dir / "translations.jsonl")
+    assert cache.get("a", "Line one\\nLine two") == "Zeile eins\\nZeile zwei"
+    assert cache.get("b", 'Say \\"no\\"') == 'Sag \\"nein\\"'
+    assert cache.get("c", "Brand New Focus") is None
+    assert cache.get("f", "Done\\nAlready") == "Erledigt\\nBereits"
+    assert (reject_dir / "rejects.jsonl").read_bytes() == rejects_before  # the cache wins anyway
+
+
+def test_cli_repair_rejects_is_a_dry_run_and_needs_no_md(reject_dir, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("MDDE_MD_ROOT", str(tmp_path / "no_md_here"))
+    monkeypatch.setenv("MDDE_CACHE_DIR", str(reject_dir))
+    before = (reject_dir / "translations.jsonl").read_bytes()
+    assert main(["revalidate", "--repair-rejects"]) == 0
+    out = capsys.readouterr().out
+    assert "Probelauf" in out and "gueltig nach Reparatur:" in out and " 2" in out
+    assert (reject_dir / "translations.jsonl").read_bytes() == before
+    with run_lock(reject_dir / "translate.lock"):
+        assert main(["revalidate", "--repair-rejects", "--apply"]) == 1
+    assert (reject_dir / "translations.jsonl").read_bytes() == before
+    assert main(["revalidate", "--repair-rejects", "--apply"]) == 0
+    assert TranslationCache(reject_dir / "translations.jsonl").get("a", "Line one\\nLine two") is not None

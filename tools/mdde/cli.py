@@ -146,7 +146,47 @@ def _short(text: str, width: int = 110) -> str:
     return repr(text if len(text) <= width else text[: width - 1] + "…")
 
 
+def _locked(cfg: Config, apply: bool, work):
+    """Run ``work`` under the run lock when it writes; ``None`` if a run holds the lock."""
+    if not apply:
+        return work()
+    try:
+        with run_lock(cfg.lock_path):
+            return work()
+    except LockBusy:
+        print(f"Ein Uebersetzungslauf haelt die Sperre {cfg.lock_path} - nichts geschrieben.",
+              file=sys.stderr)
+        return None
+
+
+def cmd_repair_rejects(args: argparse.Namespace, cfg: Config) -> int:
+    report = _locked(cfg, args.apply, lambda: revalidatemod.repair_rejects(
+        cfg.rejects_path, cfg.translations_path, apply=args.apply))
+    if report is None:
+        return 1
+    print(f"Reparatur doppelt escapter Backslashes aus {cfg.rejects_path.name} ("
+          + ("wird geschrieben" if args.apply else "Probelauf") + ")")
+    print(f"  Backslash-Ablehnungen:    {fmt(report.candidates):>6}")
+    print(f"  gueltig nach Reparatur:   {fmt(report.repaired):>6} -> {cfg.translations_path.name}")
+    still = sum(report.still_invalid.values())
+    print(f"  weiter ungueltig:         {fmt(still):>6}"
+          + (f" ({', '.join(f'{r} {n}' for r, n in report.still_invalid.most_common())})" if still else ""))
+    print(f"  ohne Antwort im Log:      {fmt(report.without_answer):>6}")
+    print(f"  inzwischen uebersetzt:    {fmt(report.already_cached):>6}")
+    if report.broken:
+        print(f"  unlesbare Zeilen:         {fmt(report.broken):>6}")
+    for key, en, de in revalidatemod.spread(report.examples, args.examples):
+        print(f"      {key}\n        EN {_short(en)}\n        DE {_short(de)}")
+    if args.apply:
+        print(f"Geschrieben ({report.repaired} angehaengt). Backup: {report.backup}")
+    else:
+        print("Nur Probelauf - nichts geschrieben. Mit --apply schreiben (vorher Backup).")
+    return 0
+
+
 def cmd_revalidate(args: argparse.Namespace, cfg: Config) -> int:
+    if getattr(args, "repair_rejects", False):
+        return cmd_repair_rejects(args, cfg)
     path = cfg.translations_path
     if not path.exists():
         print(f"Kein Cache unter {path}", file=sys.stderr)
@@ -158,16 +198,9 @@ def cmd_revalidate(args: argparse.Namespace, cfg: Config) -> int:
             apply=args.apply, examples=args.examples,
         )
 
-    if args.apply:
-        try:
-            with run_lock(cfg.lock_path):
-                report = work()
-        except LockBusy:
-            print(f"Ein Uebersetzungslauf haelt die Sperre {cfg.lock_path} - nichts geschrieben.",
-                  file=sys.stderr)
-            return 1
-    else:
-        report = work()
+    report = _locked(cfg, args.apply, work)
+    if report is None:
+        return 1
     invalid = sum(n for r, n in report.by_reason.items() if r != "unchanged")
     print(f"Revalidierung {path} (Millennium Dawn {md_version(cfg.md_root) or '?'}, "
           + ("wird geschrieben" if args.apply else "Probelauf") + ")")

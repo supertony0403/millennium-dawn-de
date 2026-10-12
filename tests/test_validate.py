@@ -189,3 +189,37 @@ def test_length_ratio_ignores_tokens():
 )
 def test_german_with_acronyms_or_quotes_is_not_english(en, de):
     assert check(en, de) is None
+
+
+# -- review 2, W-3: doubly escaped backslashes are repaired before the check -------------
+from mdde.validate import repair_escapes  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "en,de,fixed",
+    [
+        ("Line one\\nLine two", "Zeile eins\\\\nZeile zwei", "Zeile eins\\nZeile zwei"),
+        ('He said \\"no\\"', 'Er sagte \\\\"nein\\\\"', 'Er sagte \\"nein\\"'),
+        ("§YA§!\\n\\nB", "§YA§!\\\\n\\\\nB", "§YA§!\\n\\nB"),
+    ],
+)
+def test_doubly_escaped_line_breaks_and_quotes_are_repaired(en, de, fixed):
+    assert check(en, de) == "backslash"
+    assert repair_escapes(en, de) == fixed
+    assert check(en, repair_escapes(en, de)) is None
+
+
+@pytest.mark.parametrize(
+    "en,de",
+    [
+        ("Path C:\\\\new", "Pfad C:\\\\neu"),  # the source itself has a double backslash
+        ("Line one\\nLine two", "Zeile eins\\nZeile zwei"),  # nothing to repair
+        ("Ends here", "Endet hier\\"),  # a lone backslash is no double escape
+    ],
+)
+def test_repair_leaves_other_texts_alone(en, de):
+    assert repair_escapes(en, de) == de
+
+
+def test_repair_ignores_non_strings():
+    assert repair_escapes("x", None) is None

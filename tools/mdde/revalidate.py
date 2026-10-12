@@ -11,6 +11,12 @@ checked against the English text that Millennium Dawn ships *now*:
 Without ``apply`` nothing is written. With ``apply`` the cache file is first
 copied to ``translations.jsonl.bak-<UTC timestamp>`` and then replaced
 atomically by the cleaned version (older duplicates and broken lines go too).
+
+``repair_rejects`` (``revalidate --repair-rejects``) works offline on
+``rejects.jsonl``: answers rejected for ``backslash`` whose only fault is the
+model's double escaping (``\\\\n``, ``\\\\"``) are repaired and, with ``apply``,
+appended to the cache (after a backup). The reject log stays as it is - a
+cached translation always wins over a reject.
 """
 from __future__ import annotations
 
@@ -23,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import locfile, scope, validate
-from .cache import RejectLog, UnchangedLog, src_hash
+from .cache import RejectLog, TranslationCache, UnchangedLog, src_hash
 
 
 @dataclass
@@ -131,4 +137,69 @@ def revalidate(md_root: Path, cache_path: Path, rejects: RejectLog, unchanged: U
                 unchanged.add(rec["key"], en, rec.get("model"))
             else:
                 rejects.add(rec["key"], en, reason, model=rec.get("model"), de=rec["de"])
+    return report
+
+
+@dataclass
+class RepairReport:
+    candidates: int = 0  # newest reject per key + English text with reason "backslash"
+    repaired: int = 0  # valid after the repair
+    still_invalid: Counter = field(default_factory=Counter)
+    without_answer: int = 0
+    already_cached: int = 0
+    broken: int = 0  # unreadable lines or records
+    examples: list[tuple[str, str, str]] = field(default_factory=list)  # key, en, repaired de
+    backup: Path | None = None
+
+
+def _read_lines(path: Path) -> list[str]:
+    """Lines split at ``\\n`` only (``splitlines`` would also split at U+2028 inside JSON)."""
+    if not path.exists():
+        return []
+    return [line for line in path.read_text(encoding="utf-8").split("\n") if line.strip()]
+
+
+def repair_rejects(rejects_path: Path, cache_path: Path, *, apply: bool = False,
+                   now: datetime | None = None) -> RepairReport:
+    report = RepairReport()
+    latest: dict[tuple[str, str], dict] = {}
+    for line in _read_lines(Path(rejects_path)):
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            report.broken += 1
+            continue
+        if not (isinstance(rec, dict) and isinstance(rec.get("key"), str) and isinstance(rec.get("en"), str)
+                and rec.get("src_sha1") == src_hash(rec["en"])):
+            report.broken += 1
+            continue
+        latest[(rec["key"], rec["src_sha1"])] = rec
+    cache = TranslationCache(cache_path)
+    fixes: list[dict] = []
+    for rec in latest.values():
+        if rec.get("reason") != "backslash":
+            continue
+        report.candidates += 1
+        key, en, de = rec["key"], rec["en"], rec.get("de")
+        if cache.get(key, en) is not None:
+            report.already_cached += 1
+            continue
+        if not isinstance(de, str):
+            report.without_answer += 1
+            continue
+        fixed = validate.repair_escapes(en, de)
+        reason = validate.check(en, fixed)
+        if reason is not None:
+            report.still_invalid[reason] += 1
+            continue
+        report.repaired += 1
+        fixes.append({**rec, "de": fixed})
+    report.examples = [(r["key"], r["en"], r["de"]) for r in fixes]
+    if apply and fixes:
+        cache_path = Path(cache_path)
+        if cache_path.exists():
+            report.backup = _backup_path(cache_path, now or datetime.now(timezone.utc))
+            shutil.copy2(cache_path, report.backup)
+        for rec in fixes:
+            cache.put(rec["key"], rec["en"], rec["de"], rec.get("model") or "")
     return report

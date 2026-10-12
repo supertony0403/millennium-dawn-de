@@ -203,6 +203,20 @@ def foreign_escapes(en: str, de: str) -> bool:
     return bool(others(de) - others(en))
 
 
+_DOUBLE_ESCAPE_RE = re.compile(r'\\\\(?=[n"])')
+
+
+def repair_escapes(en: str, de: object) -> object:
+    """Undo a model's double escaping: ``\\\\n`` -> ``\\n`` and ``\\\\"`` -> ``\\"``.
+
+    Only when the English text has no doubled backslash of its own; anything
+    else (and a non-string) is returned unchanged. ``check`` decides afterwards.
+    """
+    if not isinstance(de, str) or "\\\\" in en or not _DOUBLE_ESCAPE_RE.search(de):
+        return de
+    return _DOUBLE_ESCAPE_RE.sub(lambda m: "\\", de)
+
+
 def _wrapped_in_quotes(text: str) -> bool:
     t = text.strip().replace('\\"', '"')
     return (

@@ -136,6 +136,7 @@ class RunReport:
     rejected: int = 0
     left_open: int = 0
     shifted_packages: int = 0
+    repaired_escapes: int = 0  # answers with doubled backslashes (\\\\n) repaired
     requests: int = 0
     stopped: str | None = None
     quota_remaining: int | None = None
@@ -460,7 +461,9 @@ class Runner:
             return self._split(texts, keys)
         if not result.ok:
             return {en: ("batch", None, None) for en in texts}
-        answers = [result.texts.get(str(i)) for i in range(len(texts))]
+        raw = [result.texts.get(str(i)) for i in range(len(texts))]
+        answers = [validate.repair_escapes(en, de) for en, de in zip(texts, raw)]
+        repaired = sum(1 for a, b in zip(raw, answers) if a is not b)
         suspicion = self._diagnose(texts, answers) if len(texts) > 1 else None
         if suspicion is not None:
             with self._stats_lock:
@@ -471,6 +474,9 @@ class Runner:
             if len(texts) > self.opts.retry_items:
                 return {en: ("shifted", result.model, None) for en in texts}
             return self._split(texts, keys)
+        if repaired:
+            with self._stats_lock:
+                self.report.repaired_escapes += repaired
         failures: dict[str, tuple] = {}
         for en, de in zip(texts, answers):
             reason = validate.check(en, de)

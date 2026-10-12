@@ -39,6 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="bereinigten Cache schreiben (vorher Backup translations.jsonl.bak-<zeit>)")
     p.set_defaults(apply=False)
     p.add_argument("--examples", type=int, default=3, metavar="N", help="Beispiele je Grund (Standard 3)")
+    p.add_argument("--repair-rejects", action="store_true",
+                   help="statt der Revalidierung: doppelt escapte Backslashes (\\\\n) in rejects.jsonl "
+                        "reparieren und gueltige in den Cache uebernehmen (offline)")
 
     sub.add_parser("build", help="Ausgabedateien unter localisation/german erzeugen")
     sub.add_parser("check", help="Ausgabedateien pruefen (Exit 1 = Fehler, 2 = veraltet)")

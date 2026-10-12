@@ -478,6 +478,19 @@ def test_discard_log_names_the_length_alignment(tmp_path):
     assert re.search(r"Grund Verschiebung, \d+ Treffer, z\. B\. k\d", line), line
 
 
+# -- review 2, W-3: doubly escaped answers are repaired, not rejected -----------------------
+def test_doubly_escaped_answers_are_repaired_and_cached(tmp_path):
+    table = {"Line one\\nLine two": "Zeile eins\\\\nZeile zwei",
+             'He said \\"no\\"': 'Er sagte \\\\"nein\\\\"'}
+    env = Env(tmp_path, responder=translator(table))
+    report = env.runner.run([("a", "Line one\\nLine two"), ("b", 'He said \\"no\\"')])
+    assert env.cache.get("a", "Line one\\nLine two") == "Zeile eins\\nZeile zwei"
+    assert env.cache.get("b", 'He said \\"no\\"') == 'Er sagte \\"nein\\"'
+    assert report.rejected == 0
+    assert report.repaired_escapes == 2
+    assert len(env.chat_calls) == 1
+
+
 # -- review finding K1: the reserve is never undercut ---------------------------------
 class LiveQuota:
     """Transport whose daily quota really drops by one per chat request.
