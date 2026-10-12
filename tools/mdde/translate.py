@@ -230,11 +230,19 @@ class Budget:
 
     Other programs may use the same key (the Discord bot). Every query
     compares the server value with what our own requests explain; the
-    difference per own request is the *external rate* (highest value of the
-    UTC day). Between two queries the estimate subtracts our requests plus
-    the expected external ones, and the stop threshold covers the requests in
-    flight together with the external requests made meanwhile. The second
-    query comes after the first request, so the rate is known early.
+    difference is counted as external requests. Once ``quota_every`` own
+    requests are measured, the *external rate* is all external requests over
+    all of our own since the run start (or the daily reset) - a quotient, so
+    a burst in one short interval is diluted instead of being kept as the
+    day's maximum - or, if higher, the same quotient over the latest
+    ``quota_every`` own requests, so a busy phase of the other program near
+    the end is not averaged away. Before that (a few requests are no
+    measurement) the busiest interval so far counts, so a quiet moment right
+    after the start cannot hide a busy program. Between two queries the estimate
+    subtracts our requests plus the expected external ones, and the stop
+    threshold covers the requests in flight together with the external
+    requests made meanwhile. The second query comes after the first request,
+    so the rate is known early.
     """
 
     def __init__(self, quota: Callable[[], dict | None], opts: RunOptions,
@@ -254,13 +262,34 @@ class Budget:
         self._last_try = 0  # ``used`` when the last query was sent (successful or not)
         self._failures = 0  # failed queries in a row
         self._querying = False  # a worker is waiting for /key outside the lock
-        self._rate = 0.0  # highest external requests per own request seen this UTC day
-        self._measured = False  # rate measured over at least one own request today
+        self._own = 0  # own requests between successful queries, since the run start / reset
+        self._external = 0  # external requests measured over the same intervals
+        # (own, external) of the latest intervals; each has >= 1 own request
+        self._intervals: deque[tuple[int, int]] = deque(maxlen=max(1, opts.quota_every))
+        self._measured = False  # at least one own request measured
         self.generation = 0
 
     @property
     def stopped(self) -> bool:
         return self.reason is not None
+
+    @property
+    def _rate(self) -> float:
+        """External requests per own request: since the run start or the daily reset, or
+        over the latest ``quota_every`` own requests if that is higher (never decided by a
+        single short interval, never held for the rest of the day). Fewer than
+        ``quota_every`` own requests measured: the busiest interval so far."""
+        if not self._own:
+            return 0.0
+        if self._own < self.opts.quota_every:  # all intervals are still in the deque
+            return max(external / own for own, external in self._intervals)
+        rate = self._external / self._own
+        own = external = 0
+        for interval_own, interval_external in reversed(self._intervals):
+            own, external = own + interval_own, external + interval_external
+            if own >= self.opts.quota_every:
+                return max(rate, external / own)
+        return rate
 
     @property
     def threshold(self) -> int:
@@ -404,12 +433,18 @@ class Budget:
         if self._base is not None and day == self._base_day:
             bound = self._base - sent  # our own requests are certainly gone
             if sent:
-                external = bound - remaining
-                self._rate = max(self._rate, external / sent if external > 0 else 0.0)
+                # a negative difference (requests still on the way, a lagging /key) is
+                # carried by the min() below and evens out at the next query
+                external = max(0, bound - remaining)
+                self._own += sent
+                self._external += external
+                self._intervals.append((sent, external))
                 self._measured = True
             remaining = min(remaining, bound)  # a lagging /key must not raise it
         else:  # first query or a new UTC day
-            self._rate, self._measured = 0.0, False
+            self._own = self._external = 0
+            self._intervals.clear()
+            self._measured = False
         self._base, self._base_day = remaining, day
         self._used_at_check = at
 

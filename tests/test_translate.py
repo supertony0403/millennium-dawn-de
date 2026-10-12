@@ -963,6 +963,81 @@ def test_a_quota_answer_from_before_a_reset_wait_is_ignored():
     assert budget.estimate() >= 1000 - 2
 
 
+# -- review 3, K1: the external rate is all external requests over all of ours -------------
+def drive_budget(budget, server, extra=lambda used: 0, limit=5000):
+    """Send requests through ``budget`` until it stops; ``server["rem"]`` drops by one per
+    request plus ``extra(used)`` requests of another program."""
+    from mdde.translate import StopRun
+
+    for _ in range(limit):
+        try:
+            budget()
+        except StopRun:
+            return
+        server["rem"] -= 1 + extra(budget.used)
+
+
+def test_a_burst_of_other_requests_at_the_start_does_not_raise_the_threshold_all_day():
+    from mdde.translate import Budget
+
+    server = {"rem": 1000, "calls": 0}
+
+    def quota():
+        server["calls"] += 1
+        if server["calls"] == 2:
+            server["rem"] -= 20  # the bot's burst, counted between the first two queries
+        return {"limit": 1000, "remaining": server["rem"]}
+
+    budget = Budget(quota, RunOptions(), None, lambda: NOON, lambda line: None)
+    budget.start()
+    drive_budget(budget, server)
+    # reserve 100 + 6 in flight; before the fix: rate 20 all day, stop at 226
+    assert 100 <= server["rem"] <= 110
+    assert budget.threshold == 107
+
+
+def test_the_external_rate_is_a_quotient_not_the_busiest_window():
+    from mdde.translate import Budget
+
+    server = {"rem": 1000}
+    budget = Budget(lambda: {"limit": 1000, "remaining": server["rem"]}, RunOptions(), None,
+                    lambda: NOON, lambda line: None)
+    budget.start()
+    for _ in range(111):
+        budget()
+        server["rem"] -= 1 + (10 if budget.used == 5 else 0)  # 10 bot requests, once
+    budget()  # the query after request 111
+    # 10 external over 111 own: 100 + ceil(6 * 1.09); before the fix 10/10 -> 100 + 12
+    assert budget.threshold == 107
+
+
+def test_a_busy_phase_of_the_other_program_near_the_end_is_not_averaged_away():
+    from mdde.translate import Budget
+
+    server = {"rem": 700}
+    budget = Budget(lambda: {"limit": 1000, "remaining": server["rem"]}, RunOptions(), None,
+                    lambda: NOON, lambda line: None)
+    budget.start()
+    drive_budget(budget, server, extra=lambda used: 3 if used > 500 else 0)
+    # the bot sends 3 per request of ours for the last ~50: the 6 requests in flight need
+    # 100 + 6 * (1 + 3); the quotient over the whole run (~0.3) would give 100 + 8
+    assert budget.threshold >= 100 + 6 * 4
+    assert server["rem"] >= 100 + 6 * 4 - 4
+
+
+def test_a_quiet_moment_at_the_start_does_not_hide_a_busy_program():
+    from mdde.translate import Budget
+
+    server = {"rem": 143}
+    budget = Budget(lambda: {"limit": 1000, "remaining": server["rem"]}, RunOptions(), None,
+                    lambda: NOON, lambda line: None)
+    budget.start()
+    # simulation J: 2 bot requests with our first, none with the next four, then 4 per request;
+    # the quotient over 5 requests (0.4) would wait 10 requests for the next /key -> 86
+    drive_budget(budget, server, extra=lambda used: 2 if used == 1 else 0 if used <= 5 else 4)
+    assert server["rem"] >= 100
+
+
 # -- review finding K2: Ctrl+C and SIGTERM stop the run quickly -------------------------
 def slow_env(tmp_path, n=300):
     def responder(payload):
