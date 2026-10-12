@@ -813,6 +813,30 @@ def test_sigterm_behaves_like_ctrl_c(tmp_path):
     assert json.loads((tmp_path / "logs" / "last_run.json").read_text())["stopped"] == "interrupted"
 
 
+def test_second_interrupt_during_shutdown_still_waits_and_counts_everything(tmp_path):
+    # review 2, k-4: Ctrl+C twice - the summary must show what really is in the cache
+    def responder(payload):
+        time.sleep(0.4)
+        batch = json.loads(payload["messages"][1]["content"])
+        return completion({i: f"Satz {en}" for i, en in batch.items()})
+
+    env = Env(tmp_path, responder=responder, workers=3, batch_items=1)
+
+    def first_interrupt():
+        threading.Timer(0.1, signal.raise_signal, args=(signal.SIGTERM,)).start()  # the second one
+        raise KeyboardInterrupt
+
+    env.runner._out = interrupt_on_first_progress(first_interrupt)
+    with pytest.raises(KeyboardInterrupt), sigterm_as_interrupt():
+        env.runner.run(sentences(30))
+    time.sleep(1.0)  # requests that might still be on the wire
+    cached = len((tmp_path / "cache" / "translations.jsonl").read_text().splitlines())
+    summary = json.loads((tmp_path / "logs" / "last_run.json").read_text())
+    assert cached >= 2
+    assert summary["translated"] == cached
+    assert summary["stopped"] == "interrupted"
+
+
 def test_stop_wakes_a_worker_waiting_for_rate_limits(tmp_path):
     transport = FakeTransport(by_model={"m1": lambda payload: error(429, "rate-limited upstream")})
 

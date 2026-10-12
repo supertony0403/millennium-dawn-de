@@ -40,7 +40,8 @@ Flow per run:
    unknown quota stops the run unless ``allow_unknown_quota`` is set;
 6. Ctrl+C (and SIGTERM inside ``sigterm_as_interrupt``) stops the run: queued
    packages are cancelled, waiting workers wake up, requests already on the
-   wire finish and are cached, ``logs/last_run.json`` is written.
+   wire finish and are cached - a second Ctrl+C does not cut that short -
+   and then ``logs/last_run.json`` is written with the real numbers.
 """
 from __future__ import annotations
 
@@ -563,10 +564,25 @@ class Runner:
             if interrupted:
                 self.log("Abbruch angefordert - keine neuen Anfragen mehr, "
                          "warte auf die Antworten, die schon unterwegs sind")
-            pool.shutdown(wait=True, cancel_futures=True)
+            self._shutdown(pool)
             raise
         pool.shutdown(wait=True)
         return failures
+
+    def _shutdown(self, pool: ThreadPoolExecutor) -> None:
+        """Cancel queued packages and wait for those on the wire, even through a
+        second Ctrl+C - otherwise the summary would be written while answers
+        are still being cached (hard stop: ``kill -9``)."""
+        warned = False
+        while True:
+            try:
+                pool.shutdown(wait=True, cancel_futures=True)
+                return
+            except KeyboardInterrupt:
+                if not warned:
+                    warned = True
+                    self.log("Bitte warten - die Antworten, die schon unterwegs sind, werden noch "
+                             "gesichert (weiteres Strg+C wird ignoriert, hart beenden: kill -9)")
 
     def _progress(self, number: int, done: int, total: int, bad: int, started: datetime) -> str:
         now = self._now()
