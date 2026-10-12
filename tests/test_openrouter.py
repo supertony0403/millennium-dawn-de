@@ -258,3 +258,10 @@ def test_missing_key_raises_without_content(tmp_path):
     assert "topsecret" not in str(excinfo.value)
     with pytest.raises(KeyNotFound):
         load_api_key({}, tmp_path / "missing.env")
+
+
+def test_unknown_quota_structure_exposes_field_names_only():
+    payload = {"data": {"label": "sk-or-v1-abc...xyz", "usage": 3, "limits": {"daily": 1}}}
+    client = make_client(FakeTransport([(200, json.dumps(payload).encode())]))
+    assert client.quota() is None
+    assert client.quota_fields == ["label", "limits", "usage"]

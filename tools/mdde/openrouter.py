@@ -142,6 +142,7 @@ class Client:
         self.stats: Counter[str] = Counter()
         self.disabled: set[str] = set()
         self.errors: list[str] = []
+        self.quota_fields: list[str] = []  # field names of the last /key answer (no values)
         self._lock = threading.Lock()
 
     def __repr__(self) -> str:
@@ -262,6 +263,7 @@ class Client:
         except (OSError, http.client.HTTPException, ValueError):
             return None
         node = data.get("data", data) if isinstance(data, dict) else None
+        self.quota_fields = sorted(node) if isinstance(node, dict) else []
         found = node.get("free_model_daily_requests") if isinstance(node, dict) else None
         if isinstance(found, dict) and "remaining" in found:
             return dict(found)

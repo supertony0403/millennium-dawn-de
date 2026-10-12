@@ -2,9 +2,111 @@
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import sys
+from collections import Counter
+from pathlib import Path
 
+from . import openrouter, scope
+from .cache import RejectLog, TranslationCache
 from .config import Config
+from .translate import RunOptions, Runner, build_system_prompt, load_glossary, make_batches
+
+FATAL_STOPS = {"auth", "no-models", "error"}
+
+
+def fmt(n: int) -> str:
+    return f"{n:,}".replace(",", ".")
+
+
+def md_version(md_root: Path) -> str | None:
+    try:
+        text = (md_root / "descriptor.mod").read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return None
+    m = re.search(r'^\s*version\s*=\s*"([^"]*)"', text, re.M)
+    return m.group(1) if m else None
+
+
+def _client(cfg: Config, system_prompt: str = "") -> openrouter.Client:
+    key = openrouter.load_api_key(os.environ, cfg.key_file)
+    return openrouter.Client(key, list(cfg.models), system_prompt=system_prompt,
+                             transport=openrouter.urllib_transport)
+
+
+def _missing_key(cfg: Config) -> None:
+    print(f"Kein OPENROUTER_API_KEY gefunden (weder in der Umgebung noch in {cfg.key_file})",
+          file=sys.stderr)
+
+
+def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
+    items = scope.collect(cfg.md_root, args.scope)
+    cache = TranslationCache(cfg.translations_path)
+    rejects = RejectLog(cfg.rejects_path)
+    cached = [i for i in items if cache.get(i.key, i.en) is not None]
+    rejected = [i for i in items if cache.get(i.key, i.en) is None and rejects.contains(i.key, i.en)]
+    todo = [i for i in items if cache.get(i.key, i.en) is None and not rejects.contains(i.key, i.en)]
+    distinct = list(dict.fromkeys(i.en for i in todo))
+    batches = make_batches([(en, en) for en in distinct], 9000, 100)
+
+    print(f"Millennium Dawn {md_version(cfg.md_root) or '?'} - Scope {args.scope}")
+    print(f"Offene Texte:            {fmt(len(items)):>9} ({fmt(sum(len(i.en) for i in items))} Zeichen)")
+    print(f"  davon im Cache:        {fmt(len(cached)):>9}")
+    print(f"  davon abgelehnt:       {fmt(len(rejected)):>9}")
+    print(f"  noch zu uebersetzen:   {fmt(len(todo)):>9} ({fmt(len(distinct))} verschiedene Texte, "
+          f"{fmt(sum(len(t) for t in distinct))} Zeichen)")
+    print(f"Geschaetzte Anfragen:    {fmt(len(batches)):>9} (Pakete <= 9000 Zeichen / <= 100 Texte)")
+    per_file = Counter(i.base for i in todo)
+    if per_file:
+        print("Groesste Dateien (offen):")
+        for base, count in per_file.most_common(8):
+            print(f"  {fmt(count):>7}  {base}")
+    if not args.no_quota:
+        try:
+            client = _client(cfg)
+            quota = client.quota()
+        except openrouter.KeyNotFound:
+            print("Tageskontingent:         unbekannt (kein OPENROUTER_API_KEY)")
+        else:
+            if quota is None:
+                print("Tageskontingent:         unbekannt (Antwort ohne free_model_daily_requests; "
+                      f"Felder: {', '.join(client.quota_fields) or '-'})")
+            else:
+                limit = quota.get("limit")
+                print(f"Tageskontingent (Gratis-Modelle): {quota['remaining']}"
+                      + (f" von {limit}" if limit is not None else "")
+                      + f" uebrig, Reserve {cfg.reserve}")
+    return 0
+
+
+def cmd_translate(args: argparse.Namespace, cfg: Config) -> int:
+    try:
+        glossary = load_glossary(cfg.glossary_path)
+    except FileNotFoundError:
+        print(f"Warnung: keine Begriffsliste unter {cfg.glossary_path}", file=sys.stderr)
+        glossary = {}
+    try:
+        client = _client(cfg, build_system_prompt(glossary))
+    except openrouter.KeyNotFound:
+        _missing_key(cfg)
+        return 1
+    items = scope.collect(cfg.md_root, args.scope)
+    runner = Runner(
+        client,
+        TranslationCache(cfg.translations_path),
+        RejectLog(cfg.rejects_path),
+        RunOptions(
+            workers=cfg.workers,
+            reserve=cfg.reserve,
+            max_requests=args.max_requests,
+            wait_for_reset=args.wait_for_reset,
+            retry_rejects=args.retry_rejects,
+        ),
+        log_dir=cfg.log_dir,
+    )
+    report = runner.run((i.key, i.en) for i in items)
+    return 1 if report.stopped in FATAL_STOPS else 0
 
 
 def _not_implemented(args: argparse.Namespace, cfg: Config) -> int:
@@ -13,8 +115,8 @@ def _not_implemented(args: argparse.Namespace, cfg: Config) -> int:
 
 
 HANDLERS = {
-    "status": _not_implemented,
-    "translate": _not_implemented,
+    "status": cmd_status,
+    "translate": cmd_translate,
     "build": _not_implemented,
     "check": _not_implemented,
     "install": _not_implemented,
