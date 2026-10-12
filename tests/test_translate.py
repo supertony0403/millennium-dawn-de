@@ -1014,6 +1014,101 @@ def test_a_quota_answer_from_before_a_reset_wait_is_ignored():
     assert budget.estimate() >= 1000 - 2
 
 
+# -- review 4, W2: after 00:00 UTC a /key still showing the old day is asked again soon ------
+def reset_budget(start, quota):
+    """Budget with --wait-for-reset whose clock moves on with every sleep."""
+    from mdde.translate import Budget
+
+    clock, sleeps, log = [start], [], []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += timedelta(seconds=seconds)
+
+    budget = Budget(lambda: quota(clock[0], sleeps), RunOptions(workers=1, wait_for_reset=True),
+                    sleep, lambda: clock[0], log.append)
+    return budget, sleeps, log
+
+
+def drive(budget, server, n):
+    from mdde.translate import StopRun
+
+    for _ in range(n):
+        try:
+            budget()
+        except StopRun:
+            return
+        server["rem"] -= 1
+
+
+def test_a_lagging_key_after_the_reset_wait_is_asked_again_within_minutes():
+    # probe W2 B of review 4: /key still shows the old value at 00:01 UTC; before the fix
+    # the run slept another 24 h
+    server = {"rem": 110}
+
+    def quota(now, sleeps):
+        if now.day == 13 and len(sleeps) >= 2:
+            return {"limit": 1000, "remaining": 1000}
+        return {"limit": 1000, "remaining": server["rem"]}
+
+    budget, sleeps, log = reset_budget(datetime(2026, 10, 12, 23, 59, tzinfo=timezone.utc), quota)
+    budget.start()
+    drive(budget, server, 30)
+    assert sleeps == [120, 300]
+    assert budget.used == 30 and budget.estimate() >= 1000 - 21
+    assert any("neue Abfrage in 300 s" in line for line in log)
+
+
+def test_a_run_reaching_the_reserve_just_after_midnight_asks_again_instead_of_waiting_a_day():
+    server = {"rem": 120}
+
+    def quota(now, sleeps):
+        # /key lags: after 00:00 UTC it still counts down the old day until we waited once
+        return {"limit": 1000, "remaining": 1000 if sleeps else server["rem"]}
+
+    clock_start = datetime(2026, 10, 12, 23, 59, 30, tzinfo=timezone.utc)
+    budget, sleeps, log = reset_budget(clock_start, quota)
+    budget.start()
+    drive(budget, server, 3)
+    budget._now = lambda: datetime(2026, 10, 13, 0, 2, tzinfo=timezone.utc)
+    drive(budget, server, 27)
+    assert sleeps == [300]
+    assert budget.used == 30 and budget.estimate() >= 1000 - 12
+
+
+def test_polling_for_the_new_quota_ends_after_an_hour_with_the_next_day_change():
+    def quota(now, sleeps):
+        return {"limit": 1000, "remaining": 1000 if now.day == 14 else 101}
+
+    budget, sleeps, log = reset_budget(datetime(2026, 10, 12, 23, 59, tzinfo=timezone.utc), quota)
+    budget.start()  # 101 <= reserve 100 + 1 in flight: waits at once
+    # 00:01 UTC, then every 5 min for an hour, then until 00:01 UTC of the next day
+    assert sleeps == [120] + [300] * 12 + [23 * 3600]
+    assert budget.estimate() == 1000
+
+
+def test_a_daily_limit_hit_right_after_midnight_is_asked_again_within_minutes():
+    # HTTP 429 "free-models-per-day" at 00:00:30 UTC: the server has not reset yet
+    from mdde.translate import Budget
+
+    clock, sleeps = [datetime(2026, 10, 12, 23, 58, tzinfo=timezone.utc)], []
+    values = [500, 499]
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += timedelta(seconds=seconds)
+
+    budget = Budget(lambda: {"limit": 1000, "remaining": values.pop(0) if values else 1000},
+                    RunOptions(workers=1, wait_for_reset=True), sleep, lambda: clock[0],
+                    lambda line: None)
+    budget.start()
+    budget()
+    budget()
+    clock[0] = datetime(2026, 10, 13, 0, 0, 30, tzinfo=timezone.utc)
+    budget.on_daily_limit(budget.generation)
+    assert sleeps == [300]
+
+
 # -- review 3, K1: the external rate is all external requests over all of ours -------------
 def drive_budget(budget, server, extra=lambda used: 0, limit=5000):
     """Send requests through ``budget`` until it stops; ``server["rem"]`` drops by one per

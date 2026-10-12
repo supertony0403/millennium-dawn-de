@@ -41,6 +41,9 @@ Flow per run:
    flight are covered by ``workers``). Within a quota period a server value
    never raises the local estimate (``/key`` may lag behind); after 00:00 UTC
    a jump of more than ``quota_every + workers`` above it is the daily reset.
+   With ``wait_for_reset``, a /key that still shows the old day after 00:00 UTC
+   is asked again every ``RESET_POLL_EVERY`` s for an hour before the run waits
+   for the next day change.
    A failed query is retried after ``quota_every`` requests (near the end
    after ``KEY_RETRY_EVERY``), outside the budget lock; the other workers wait
    up to ``KEY_WAIT`` for its answer, so the server cannot count requests of
@@ -83,6 +86,10 @@ Regeln:
 - Verwende die Begriffe der offiziellen deutschen HOI4-Version:"""
 
 MAX_RESET_WAITS = 3
+# after 00:00 UTC /key may still show the old day: ask again every RESET_POLL_EVERY s, at
+# most RESET_POLLS times (one hour), before waiting for the next day change
+RESET_POLL_EVERY = 300
+RESET_POLLS = 12
 SUSPECT_LENGTH_VIOLATIONS = 3  # length-ratio violations that discard a package
 SUSPECT_NEIGHBOUR_FITS = 2  # answers that fit a neighbour instead of their own text
 # length alignment, calibrated on Millennium Dawn's 39,018 human pairs and the cache
@@ -268,6 +275,8 @@ class Budget:
         self.remaining: int | None = None  # last value reported by /key
         self._base: int | None = None  # upper bound of remaining at the last successful query
         self._period_day = None  # UTC date the current quota period was first seen
+        self._reset_due = False  # waited until after 00:00 UTC, the new quota not seen yet
+        self._polls = 0  # short waits for a /key still showing the old day, since the last wait
         self._used_at_check = 0  # ``used`` when the last successful query was sent
         self._last_try = 0  # ``used`` when the last query was sent (successful or not)
         self._failures = 0  # failed queries in a row
@@ -365,7 +374,7 @@ class Budget:
             if not self.opts.wait_for_reset:
                 self.stop("quota")
                 return
-            self._sleep_until_reset()
+            self._sleep_until_reset(self._reset_pending())
             self._check_quota()
 
     def _check_max_requests(self) -> None:  # lock held
@@ -432,18 +441,23 @@ class Budget:
             self.stop("quota-unknown")
 
     def _enforce(self) -> None:  # lock held
-        """Stop (or wait for the daily reset) once the estimate reaches the threshold."""
-        for attempt in range(MAX_RESET_WAITS + 1):
+        """Stop (or wait for the daily reset) once the estimate reaches the threshold.
+        After 00:00 UTC, while /key still shows the old day, ask again within minutes."""
+        waits = 0
+        while True:
             estimate = self.estimate()
             if self.stopped or estimate is None or estimate > self.threshold:
                 return
-            self._log(f"Tageskontingent {estimate} <= Reserve {self.opts.reserve} "
-                      f"+ {self.threshold - self.opts.reserve} (parallele Anfragen"
-                      + (f", Fremdnutzung {self._rate:.1f} je eigene Anfrage)" if self._rate else ")"))
-            if not self.opts.wait_for_reset or attempt == MAX_RESET_WAITS:
-                self.stop("quota")
-                return
-            self._sleep_until_reset()
+            poll = self.opts.wait_for_reset and self._reset_pending()
+            if not poll:
+                self._log(f"Tageskontingent {estimate} <= Reserve {self.opts.reserve} "
+                          f"+ {self.threshold - self.opts.reserve} (parallele Anfragen"
+                          + (f", Fremdnutzung {self._rate:.1f} je eigene Anfrage)" if self._rate else ")"))
+                if not self.opts.wait_for_reset or waits == MAX_RESET_WAITS:
+                    self.stop("quota")
+                    return
+                waits += 1
+            self._sleep_until_reset(poll)
             if self.stopped:
                 return
             self._last_try = self.used
@@ -451,19 +465,22 @@ class Budget:
 
     def _accept(self, remaining: int, at: int) -> None:  # lock held
         """Take a server value. Within a quota period it may only lower the estimate
-        (``/key`` may lag behind). After 00:00 UTC a value more than ``quota_every +
-        workers`` above what our own requests leave is the daily reset - even when the
-        first query of the new day still showed the old value: a new base, and the
-        external rate starts from zero."""
+        (``/key`` may lag behind). After 00:00 UTC (or a wait for it) a value more than
+        ``quota_every + workers`` above what our own requests leave is the daily reset -
+        even when the first query of the new day still showed the old value: a new base,
+        and the external rate starts from zero."""
         self.remaining = remaining
         day = self._now().date()
         sent = at - self._used_at_check
         bound = None if self._base is None else self._base - sent  # our requests are gone
-        if bound is None or (day > self._period_day
+        new_day = self._reset_due or (self._period_day is not None and day > self._period_day)
+        if bound is None or (new_day
                              and remaining > bound + self.opts.quota_every + self.opts.workers):
             if bound is not None:
                 self._log(f"Neues Tageskontingent erkannt: {remaining} statt hoechstens {bound} "
                           f"- Fremdnutzung wird neu gemessen")
+            self._reset_due = False
+            self._polls = 0
             self._own = self._external = 0
             self._intervals.clear()
             self._measured = False
@@ -481,13 +498,32 @@ class Budget:
         self._base = remaining
         self._used_at_check = at
 
-    def _sleep_until_reset(self) -> None:  # lock held
+    def _reset_pending(self) -> bool:  # lock held
+        """Within the first hour after 00:00 UTC, before the new day's quota showed up."""
         now = self._now()
-        midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        seconds = math.ceil((midnight - now).total_seconds()) + 60
-        self._log(f"warte {seconds} s bis nach 00:00 UTC auf das neue Kontingent")
+        since_midnight = now - now.replace(hour=0, minute=0, second=0, microsecond=0)
+        new_day = self._reset_due or (self._period_day is not None and now.date() > self._period_day)
+        return (new_day and self._polls < RESET_POLLS
+                and since_midnight < timedelta(seconds=RESET_POLL_EVERY * RESET_POLLS))
+
+    def _sleep_until_reset(self, poll: bool = False) -> None:  # lock held
+        """Sleep until after 00:00 UTC - or, after it (``poll``), ``RESET_POLL_EVERY`` s for a
+        /key that still shows the old day. The base stays: the next value is the new day's
+        quota only if it is clearly higher (``_accept``), so a lagging /key cannot set a new
+        day with the old, exhausted value."""
+        if poll:
+            seconds = RESET_POLL_EVERY
+            self._polls += 1
+            self._log(f"Tageskontingent noch nicht zurueckgesetzt (/key meldet {self.remaining}) "
+                      f"- neue Abfrage in {seconds} s")
+        else:
+            now = self._now()
+            midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            seconds = math.ceil((midnight - now).total_seconds()) + 60
+            self._log(f"warte {seconds} s bis nach 00:00 UTC auf das neue Kontingent")
+            self._reset_due = True
+            self._polls = 0
         self._sleep(seconds)
-        self._base = None  # the old value belongs to the previous day
         self.generation += 1
 
 
