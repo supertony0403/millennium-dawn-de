@@ -868,6 +868,101 @@ def test_failing_quota_check_mid_run_keeps_counting_locally(tmp_path):
     assert report.stopped == "quota"
 
 
+# -- review 3, W1: a failing /key is retried sparingly and never under the budget lock -------
+NOON = datetime(2026, 10, 12, 12, tzinfo=timezone.utc)
+
+
+def failing_after_start(calls):
+    def quota():
+        calls.append(1)
+        return {"limit": 1000, "remaining": 1000} if len(calls) == 1 else None
+    return quota
+
+
+def test_failed_quota_checks_are_retried_every_ten_requests(tmp_path):
+    from mdde.translate import Budget
+
+    calls, log = [], []
+    budget = Budget(failing_after_start(calls), RunOptions(), None, lambda: NOON, log.append)
+    budget.start()
+    for _ in range(200):
+        budget()
+    # start, after the first request, then every 10 (before the fix: before every request)
+    assert len(calls) == 1 + 1 + 19
+    failed = [line for line in log if "Kontingent-Abfrage fehlgeschlagen" in line]
+    assert len(failed) == 3  # the 1st, 10th and 20th failure
+    assert "20" in failed[-1]
+
+
+def test_near_the_reserve_a_failing_quota_check_is_retried_every_five_requests(tmp_path):
+    live = LiveQuota(130, key_fails_after=1)
+    report = live_runner(tmp_path, live, workers=1, reserve=100).run(sentences(400))
+    # /key: start, after request 1, after 11; estimate <= 111 from request 19: 19, 24, 29
+    assert live.posts == 29 and live.lowest >= 100 and report.stopped == "quota"
+    assert live.key_calls == 6  # before the fix: 30
+
+
+def test_a_hanging_quota_check_does_not_block_other_workers():
+    from mdde.translate import Budget
+
+    release, calls = threading.Event(), []
+
+    def quota():
+        calls.append(1)
+        if len(calls) == 2:  # the first check during the run hangs (timeout up to 30 s)
+            release.wait(5)
+        return {"limit": 1000, "remaining": 1000}
+
+    budget = Budget(quota, RunOptions(workers=2), None, lambda: NOON, lambda line: None)
+    budget.start()
+    budget()
+    checker = threading.Thread(target=budget)
+    checker.start()
+    while len(calls) < 2:
+        time.sleep(0.001)
+    passed = threading.Event()
+    other = threading.Thread(target=lambda: (budget(), budget(), passed.set()))
+    other.start()
+    try:
+        assert passed.wait(2)  # before the fix: blocked until /key answered
+        assert len(calls) == 2  # ... and started no second query meanwhile
+    finally:
+        release.set()
+        checker.join()
+        other.join()
+    assert budget.used == 4
+
+
+def test_a_quota_answer_from_before_a_reset_wait_is_ignored():
+    from mdde.translate import Budget
+
+    release, started, calls = threading.Event(), threading.Event(), []
+    clock = [datetime(2026, 10, 12, 23, 50, tzinfo=timezone.utc)]
+
+    def quota():
+        calls.append(1)
+        if len(calls) == 2:  # asked before the daily limit hit, answers after the reset
+            started.set()
+            release.wait(5)
+            return {"limit": 1000, "remaining": 120}
+        return {"limit": 1000, "remaining": 500 if len(calls) == 1 else 1000}
+
+    def sleep(seconds):
+        clock[0] += timedelta(seconds=seconds)
+
+    budget = Budget(quota, RunOptions(workers=2, wait_for_reset=True), sleep, lambda: clock[0],
+                    lambda line: None)
+    budget.start()
+    budget()
+    checker = threading.Thread(target=budget)
+    checker.start()
+    started.wait(2)
+    budget.on_daily_limit(budget.generation)  # 429: waits for 00:00 UTC, then reads 1000
+    release.set()
+    checker.join()
+    assert budget.estimate() >= 1000 - 2
+
+
 # -- review finding K2: Ctrl+C and SIGTERM stop the run quickly -------------------------
 def slow_env(tmp_path, n=300):
     def responder(payload):

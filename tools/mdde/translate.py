@@ -96,6 +96,8 @@ MAX_SPLIT_DEPTH = 2  # halving levels per round for a package refused by moderat
 # every package is still dropped after 14 packages
 DISCARD_WINDOW = 20
 DISCARD_TRIP = 14
+KEY_RETRY_EVERY = 5  # near the threshold: own requests between two tries after a failed /key
+KEY_FAIL_LOG_EVERY = 10  # log the first failed /key query in a row and every 10th
 
 
 def load_glossary(path: Path) -> dict[str, str]:
@@ -214,9 +216,17 @@ class StopRun(Exception):
 class Budget:
     """Request gate installed as ``Client.before_request``.
 
-    ``_lock`` serialises the accounting of requests and the quota queries;
-    ``stop`` never takes it, so a stop request is never blocked by a worker
-    that sleeps until the daily reset while holding it.
+    ``_lock`` serialises the accounting of requests; ``stop`` never takes it,
+    so a stop request is never blocked by a worker that sleeps until the daily
+    reset while holding it. A regular ``/key`` query runs *outside* the lock
+    (it may hang up to the 30 s timeout): one worker asks, the others go on
+    with the local estimate, and the answer is taken in under the lock - an
+    answer from before a reset wait (``generation``) is dropped. Only the
+    start and the queries right after a reset wait run under the lock.
+
+    A failed query is retried after ``quota_every`` requests, within
+    ``quota_every`` of the stop threshold after ``KEY_RETRY_EVERY``; the log
+    names the first and every ``KEY_FAIL_LOG_EVERY``-th failure in a row.
 
     Other programs may use the same key (the Discord bot). Every query
     compares the server value with what our own requests explain; the
@@ -240,7 +250,10 @@ class Budget:
         self.remaining: int | None = None  # last value reported by /key
         self._base: int | None = None  # upper bound of remaining at the last successful query
         self._base_day = None  # UTC date of ``_base``
-        self._used_at_check = 0
+        self._used_at_check = 0  # ``used`` when the last successful query was sent
+        self._last_try = 0  # ``used`` when the last query was sent (successful or not)
+        self._failures = 0  # failed queries in a row
+        self._querying = False  # a worker is waiting for /key outside the lock
         self._rate = 0.0  # highest external requests per own request seen this UTC day
         self._measured = False  # rate measured over at least one own request today
         self.generation = 0
@@ -279,16 +292,24 @@ class Budget:
 
     def __call__(self) -> None:
         with self._lock:
-            if not self.stopped and self.opts.max_requests is not None \
-                    and self.used >= self.opts.max_requests:
-                self.stop("max-requests")
-            if not self.stopped:
-                estimate = self.estimate()
-                sent = self.used - self._used_at_check
-                due = sent >= (self.opts.quota_every if self._measured else 1)
-                near = estimate is not None and estimate <= self.threshold + self.opts.quota_every
-                if due or near:
-                    self._check_quota()
+            self._check_max_requests()
+            query = not self.stopped and self._query_due()
+            if query:
+                self._querying = True
+                self._last_try = at = self.used
+                generation = self.generation
+        if query:
+            info = None
+            try:
+                info = self._quota()
+            finally:
+                with self._lock:
+                    self._querying = False
+                    if generation == self.generation and not self.stopped:
+                        self._take(info, at)
+        with self._lock:
+            self._check_max_requests()
+            self._enforce()
             if self.reason is not None:
                 raise StopRun(self.reason)
             self.used += 1
@@ -304,30 +325,64 @@ class Budget:
             self._sleep_until_reset()
             self._check_quota()
 
+    def _check_max_requests(self) -> None:  # lock held
+        if not self.stopped and self.opts.max_requests is not None \
+                and self.used >= self.opts.max_requests:
+            self.stop("max-requests")
+
+    def _query_due(self) -> bool:  # lock held
+        """Time for a /key query before the next request?"""
+        if self._querying:
+            return False  # another worker is asking; go on with the local estimate
+        estimate = self.estimate()
+        near = estimate is not None and estimate <= self.threshold + self.opts.quota_every
+        if self._failures:
+            interval = KEY_RETRY_EVERY if near else self.opts.quota_every
+        else:
+            interval = 1 if near or not self._measured else self.opts.quota_every
+        return self.used - self._last_try >= interval
+
     def _check_quota(self) -> None:  # lock held
+        """Query /key under the lock (start, after a reset wait) and enforce the threshold."""
+        if self.stopped:
+            return
+        self._last_try = self.used
+        self._take(self._quota(), self.used)
+        self._enforce()
+
+    def _take(self, info: dict | None, at: int) -> None:  # lock held
+        """Take in a /key answer for a query sent when ``used`` was ``at``."""
+        remaining = info.get("remaining") if info else None
+        if isinstance(remaining, int) and not isinstance(remaining, bool):
+            if at < self._used_at_check:
+                return  # overtaken by a newer answer
+            if self._failures:
+                self._log(f"Kontingent-Abfrage wieder erfolgreich nach {self._failures} Fehlschlaegen")
+            self._failures = 0
+            self._accept(remaining, at)
+            return
+        self._failures += 1
+        first_or_tenth = self._failures == 1 or self._failures % KEY_FAIL_LOG_EVERY == 0
+        if self._base is not None:
+            if first_or_tenth:
+                self._log(f"Kontingent-Abfrage fehlgeschlagen ({self._failures}x in Folge) - rechne "
+                          f"lokal weiter (geschaetzt {self.estimate()}), neuer Versuch nach "
+                          f"{self.opts.quota_every} Anfragen, nahe der Reserve nach {KEY_RETRY_EVERY}")
+        elif self.opts.allow_unknown_quota:
+            if first_or_tenth:
+                self._log("Tageskontingent unbekannt - fahre ohne Kontingentpruefung fort "
+                          "(--allow-unknown-quota)")
+        else:
+            self._log("Tageskontingent unbekannt (Abfrage /key fehlgeschlagen) - Abbruch, "
+                      "damit die Reserve nicht angetastet wird; --allow-unknown-quota erlaubt "
+                      "den Lauf ohne Pruefung")
+            self.stop("quota-unknown")
+
+    def _enforce(self) -> None:  # lock held
+        """Stop (or wait for the daily reset) once the estimate reaches the threshold."""
         for attempt in range(MAX_RESET_WAITS + 1):
-            if self.stopped:
-                return
-            info = self._quota()
-            remaining = info.get("remaining") if info else None
-            if isinstance(remaining, int) and not isinstance(remaining, bool):
-                self._accept(remaining)
-            elif self._base is None:
-                if self.opts.allow_unknown_quota:
-                    self._log("Tageskontingent unbekannt - fahre ohne Kontingentpruefung fort "
-                              "(--allow-unknown-quota)")
-                    return
-                self._log("Tageskontingent unbekannt (Abfrage /key fehlgeschlagen) - Abbruch, "
-                          "damit die Reserve nicht angetastet wird; --allow-unknown-quota erlaubt "
-                          "den Lauf ohne Pruefung")
-                self.stop("quota-unknown")
-                return
-            else:
-                self._log(f"Kontingent-Abfrage fehlgeschlagen - rechne lokal weiter "
-                          f"(geschaetzt {self.estimate()})")
             estimate = self.estimate()
-            assert estimate is not None
-            if estimate > self.threshold:
+            if self.stopped or estimate is None or estimate > self.threshold:
                 return
             self._log(f"Tageskontingent {estimate} <= Reserve {self.opts.reserve} "
                       f"+ {self.threshold - self.opts.reserve} (parallele Anfragen"
@@ -336,12 +391,16 @@ class Budget:
                 self.stop("quota")
                 return
             self._sleep_until_reset()
+            if self.stopped:
+                return
+            self._last_try = self.used
+            self._take(self._quota(), self.used)
 
-    def _accept(self, remaining: int) -> None:  # lock held
+    def _accept(self, remaining: int, at: int) -> None:  # lock held
         """Take a server value; within one UTC day it may only lower the estimate."""
         self.remaining = remaining
         day = self._now().date()
-        sent = self.used - self._used_at_check
+        sent = at - self._used_at_check
         if self._base is not None and day == self._base_day:
             bound = self._base - sent  # our own requests are certainly gone
             if sent:
@@ -352,7 +411,7 @@ class Budget:
         else:  # first query or a new UTC day
             self._rate, self._measured = 0.0, False
         self._base, self._base_day = remaining, day
-        self._used_at_check = self.used
+        self._used_at_check = at
 
     def _sleep_until_reset(self) -> None:  # lock held
         now = self._now()
