@@ -51,6 +51,7 @@ _TRAILING_BACKSLASH_RE = re.compile(r"(?<!\\)(?:\\\\)*\\$")
 _ESCAPE_RE = re.compile(r"\\(.)", re.S)
 _ALLOWED_ESCAPES = frozenset('n"')
 _COLOUR_RE = re.compile(r"§!|§[A-Za-z0-9]")
+_COLOUR_SPAN_RE = re.compile(r"§[A-Za-z0-9][^§]*§!")  # innermost span
 _WORD_RE = re.compile(r"[^\W\d_]+")
 _IDENTIFIER_RE = re.compile(r"\w*_\w*")
 
@@ -108,6 +109,11 @@ def _stopword_hits(text: str) -> tuple[int, int]:
     return (sum(w in ENGLISH_STOPWORDS for w in found), sum(w in GERMAN_STOPWORDS for w in found))
 
 
+def _drop_kept_spans(en: str, de: str) -> str:
+    """``de`` without colour spans that occur verbatim in ``en`` (kept names/titles)."""
+    return _COLOUR_SPAN_RE.sub(lambda m: " " if m.group(0) in en else m.group(0), de)
+
+
 def looks_english(en: str, de: str) -> bool:
     """Heuristic for untranslated leftovers in ``de``.
 
@@ -116,8 +122,11 @@ def looks_english(en: str, de: str) -> bool:
     * short texts (``de`` >= 3 words): >= 2 English stop words making up
       >= 25 % of the words and not a single German stop word.
 
-    Proper names such as "Bank of Canada" contribute one stop word and pass.
+    Proper names such as "Bank of Canada" contribute one stop word and pass;
+    words inside a colour span taken over unchanged from ``en``
+    (``§YThe Leader of the Free World§!``) are not counted.
     """
+    de = _drop_kept_spans(en, de)
     found = words(de)
     en_hits, de_hits = _stopword_hits(de)
     if len(words(en)) >= ENGLISH_MIN_SOURCE_WORDS and en_hits >= ENGLISH_MIN_HITS and en_hits >= de_hits:

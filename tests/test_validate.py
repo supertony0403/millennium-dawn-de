@@ -278,3 +278,22 @@ def test_legitimately_unchanged_texts_are_not_translatable(en):
 @pytest.mark.parametrize("sep", [" ", " ", "\u0085"])
 def test_unicode_line_separators_are_rejected(sep):
     assert check("German Unity now", f"Deutsche Einheit{sep}jetzt") == "newline"
+
+
+# -- review 2, k-6: English kept verbatim in a colour span is no untranslated leftover ----
+@pytest.mark.parametrize(
+    "en,de",
+    [
+        ("Speech by §YThe Leader of the Free World§!", "Rede von §YThe Leader of the Free World§!"),
+        ("§YThe Bank of the North§! has opened a new office in our capital city today",
+         "§YThe Bank of the North§! hat heute eine neue Filiale in unserer Hauptstadt eröffnet"),
+    ],
+)
+def test_english_inside_a_kept_colour_span_is_not_counted(en, de):
+    assert check(en, de) is None
+
+
+def test_english_in_a_changed_colour_span_still_counts():
+    en = "Word §YWe are the champions of the world§! more words here"
+    de = "Wort §YWe are the champions of our world§! weitere Wörter hier"
+    assert check(en, de) == "english"
