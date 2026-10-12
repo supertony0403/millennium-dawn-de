@@ -7,3 +7,6 @@ cache/*.lock
 logs/
 build/
 *.egg-info/
+localisation/
+build_info.json
+logs/
