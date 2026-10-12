@@ -121,3 +121,30 @@ def test_translate_skips_unchanged_unless_retry_unchanged(env, monkeypatch):
     assert main(["translate", "--retry-unchanged"]) == 0
     sent = [en for c in transport2.calls for en in json.loads(c.body["messages"][1]["content"]).values()]
     assert sent == ["German Unity"]
+
+
+def test_translate_with_unknown_quota_fails_unless_allowed(env, monkeypatch, capsys):
+    monkeypatch.setenv("OPENROUTER_API_KEY", KEY)
+    transport = fake_translator()
+
+    def route(method, url, headers, body, timeout):
+        return (500, b"{}") if method == "GET" else transport(method, url, headers, body, timeout)
+
+    monkeypatch.setattr(openrouter, "urllib_transport", route)
+    assert main(["translate"]) == 1
+    assert transport.calls == []
+    assert "Tageskontingent unbekannt" in capsys.readouterr().out
+    assert main(["translate", "--allow-unknown-quota"]) == 0
+    assert transport.calls
+
+
+def test_translate_ctrl_c_exits_130(env, monkeypatch, capsys):
+    monkeypatch.setenv("OPENROUTER_API_KEY", KEY)
+    monkeypatch.setattr(openrouter, "urllib_transport", quota_aware(fake_translator()))
+
+    def interrupted(self, units):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("mdde.cli.Runner.run", interrupted)
+    assert main(["translate"]) == 130
+    assert "Abgebrochen" in capsys.readouterr().err

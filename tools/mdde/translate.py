@@ -13,17 +13,26 @@ Flow per run:
    as a whole: big packages go to round two, small ones are split in halves;
 4. round two: invalid or failed texts again in packages of 10; texts that are
    still invalid go to the reject log (the English text stays in the game);
-5. a budget (``Budget``) guards every request: ``--max-requests``, the free
-   daily quota (checked at start and every 50 requests) and the reserve that
-   is left for other applications.
+5. a budget (``Budget``) guards every request: ``--max-requests`` and the
+   free daily quota. The quota is queried at the start and every 50 requests
+   and counted down locally in between; once the estimate reaches
+   ``reserve + workers`` it is queried again and the run stops there, so the
+   reserve for other applications is never used up (requests that are still
+   in flight are covered by ``workers``). An unknown quota stops the run
+   unless ``allow_unknown_quota`` is set;
+6. Ctrl+C (and SIGTERM inside ``sigterm_as_interrupt``) stops the run: queued
+   packages are cancelled, waiting workers wake up, requests already on the
+   wire finish and are cached, ``logs/last_run.json`` is written.
 """
 from __future__ import annotations
 
 import json
 import math
+import signal
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -82,10 +91,11 @@ def make_batches(units: list[tuple[str, str]], max_chars: int, max_items: int) -
 
 @dataclass
 class RunOptions:
-    workers: int = 3
+    workers: int = 6
     reserve: int = 100
     max_requests: int | None = None
     wait_for_reset: bool = False
+    allow_unknown_quota: bool = False
     quota_every: int = 50
     batch_chars: int = 9000
     batch_items: int = 100
@@ -120,25 +130,52 @@ class StopRun(Exception):
 
 
 class Budget:
-    """Request gate installed as ``Client.before_request``."""
+    """Request gate installed as ``Client.before_request``.
+
+    ``_lock`` serialises the accounting of requests and the quota queries;
+    ``stop`` never takes it, so a stop request is never blocked by a worker
+    that sleeps until the daily reset while holding it.
+    """
 
     def __init__(self, quota: Callable[[], dict | None], opts: RunOptions,
-                 sleep: Callable[[float], None], now: Callable[[], datetime],
+                 sleep: Callable[[float], None] | None, now: Callable[[], datetime],
                  log: Callable[[str], None]) -> None:
-        self._quota, self.opts, self._sleep, self._now, self._log = quota, opts, sleep, now, log
+        self._quota, self.opts, self._now, self._log = quota, opts, now, log
+        self._stopped = threading.Event()
+        self._sleep = sleep if sleep is not None else self.wait
         self._lock = threading.Lock()
+        self._reason_lock = threading.Lock()
         self.used = 0
         self.reason: str | None = None
-        self.remaining: int | None = None
+        self.remaining: int | None = None  # last value reported by /key
+        self._base: int | None = None  # remaining at the last successful query
+        self._used_at_check = 0
         self.generation = 0
 
     @property
     def stopped(self) -> bool:
         return self.reason is not None
 
+    @property
+    def threshold(self) -> int:
+        """Estimated quota at which the run stops: reserve + requests in flight."""
+        return self.opts.reserve + self.opts.workers
+
+    def estimate(self) -> int | None:
+        """Quota left: last queried value minus the requests sent since then."""
+        if self._base is None:
+            return None
+        return self._base - (self.used - self._used_at_check)
+
     def stop(self, reason: str) -> None:
-        with self._lock:
-            self.reason = self.reason or reason
+        with self._reason_lock:
+            if self.reason is None:
+                self.reason = reason
+        self._stopped.set()
+
+    def wait(self, seconds: float) -> None:
+        """Sleep that ends early when the run is stopped."""
+        self._stopped.wait(seconds)
 
     def start(self) -> None:
         with self._lock:
@@ -146,11 +183,14 @@ class Budget:
 
     def __call__(self) -> None:
         with self._lock:
-            if self.reason is None and self.opts.max_requests is not None \
+            if not self.stopped and self.opts.max_requests is not None \
                     and self.used >= self.opts.max_requests:
-                self.reason = "max-requests"
-            if self.reason is None and self.used and self.used % self.opts.quota_every == 0:
-                self._check_quota()
+                self.stop("max-requests")
+            if not self.stopped:
+                estimate = self.estimate()
+                due = self.used and self.used % self.opts.quota_every == 0
+                if due or (estimate is not None and estimate <= self.threshold):
+                    self._check_quota()
             if self.reason is not None:
                 raise StopRun(self.reason)
             self.used += 1
@@ -158,27 +198,44 @@ class Budget:
     def on_daily_limit(self, generation: int) -> None:
         """A request hit the daily free limit (HTTP 429 "free-models-per-day")."""
         with self._lock:
-            if self.reason is not None or generation != self.generation:
+            if self.stopped or generation != self.generation:
                 return
             if not self.opts.wait_for_reset:
-                self.reason = "quota"
+                self.stop("quota")
                 return
             self._sleep_until_reset()
             self._check_quota()
 
     def _check_quota(self) -> None:  # lock held
         for attempt in range(MAX_RESET_WAITS + 1):
+            if self.stopped:
+                return
             info = self._quota()
             remaining = info.get("remaining") if info else None
-            self.remaining = remaining if isinstance(remaining, int) else None
-            if self.remaining is None:
-                self._log("Tageskontingent unbekannt - fahre ohne Kontingentpruefung fort")
+            if isinstance(remaining, int) and not isinstance(remaining, bool):
+                self.remaining = self._base = remaining
+                self._used_at_check = self.used
+            elif self._base is None:
+                if self.opts.allow_unknown_quota:
+                    self._log("Tageskontingent unbekannt - fahre ohne Kontingentpruefung fort "
+                              "(--allow-unknown-quota)")
+                    return
+                self._log("Tageskontingent unbekannt (Abfrage /key fehlgeschlagen) - Abbruch, "
+                          "damit die Reserve nicht angetastet wird; --allow-unknown-quota erlaubt "
+                          "den Lauf ohne Pruefung")
+                self.stop("quota-unknown")
                 return
-            if self.remaining > self.opts.reserve:
+            else:
+                self._log(f"Kontingent-Abfrage fehlgeschlagen - rechne lokal weiter "
+                          f"(geschaetzt {self.estimate()})")
+            estimate = self.estimate()
+            assert estimate is not None
+            if estimate > self.threshold:
                 return
-            self._log(f"Tageskontingent {self.remaining} <= Reserve {self.opts.reserve}")
+            self._log(f"Tageskontingent {estimate} <= Reserve {self.opts.reserve} "
+                      f"+ {self.opts.workers} parallele Anfragen")
             if not self.opts.wait_for_reset or attempt == MAX_RESET_WAITS:
-                self.reason = "quota"
+                self.stop("quota")
                 return
             self._sleep_until_reset()
 
@@ -188,13 +245,40 @@ class Budget:
         seconds = math.ceil((midnight - now).total_seconds()) + 60
         self._log(f"warte {seconds} s bis nach 00:00 UTC auf das neue Kontingent")
         self._sleep(seconds)
+        self._base = None  # the old value belongs to the previous day
         self.generation += 1
+
+
+@contextmanager
+def sigterm_as_interrupt() -> Iterator[None]:
+    """Turn SIGTERM into ``KeyboardInterrupt`` so a run stops like on Ctrl+C."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def handler(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt(signal.Signals(signum).name)
+
+    previous = signal.signal(signal.SIGTERM, handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def format_duration(seconds: float) -> str:
+    minutes = round(seconds / 60)
+    if minutes < 1:
+        return "<1 min"
+    if minutes < 60:
+        return f"{minutes} min"
+    return f"{minutes // 60} h {minutes % 60:02d} min"
 
 
 class Runner:
     def __init__(self, client: Client, cache: TranslationCache, rejects: RejectLog,
                  opts: RunOptions, *, log_dir: Path, unchanged: UnchangedLog | None = None,
-                 sleep: Callable[[float], None] = time.sleep,
+                 sleep: Callable[[float], None] | None = None,
                  now: Callable[[], datetime] | None = None,
                  out: Callable[[str], None] = lambda line: print(line, flush=True)) -> None:
         self.client, self.cache, self.rejects, self.opts = client, cache, rejects, opts
@@ -208,6 +292,8 @@ class Runner:
         self._stats_lock = threading.Lock()
         self.budget = Budget(client.quota, opts, sleep, self._now, self.log)
         client.before_request = self.budget
+        if client.sleep is time.sleep:  # real waits for rate limits end on stop
+            client.sleep = self.budget.wait
         self.report = RunReport()
 
     # -- logging -------------------------------------------------------------
@@ -299,26 +385,56 @@ class Runner:
                max_items: int) -> dict[str, tuple]:
         batches = make_batches([(en, en) for en in texts], self.opts.batch_chars, max_items)
         failures: dict[str, tuple] = {}
-        with ThreadPoolExecutor(max_workers=self.opts.workers) as pool:
+        started = self._now()
+        pool = ThreadPoolExecutor(max_workers=self.opts.workers)
+        try:
             futures = [pool.submit(self._process, [en for en, _ in b], keys) for b in batches]
             for done, future in enumerate(as_completed(futures), 1):
-                try:
-                    failed = future.result()
-                except Exception:
-                    self.budget.stop("error")
-                    raise
+                failed = future.result()
                 failures.update(failed)
                 bad = sum(1 for f in failed.values() if f[0] not in ("skipped",))
-                self.log(
-                    f"[R{number} {done}/{len(batches)}] {bad} fehlgeschlagen | "
-                    f"{self.report.translated}/{self.report.todo} Texte | "
-                    f"{self.client.stats['requests']} Anfragen"
-                )
+                self.log(self._progress(number, done, len(batches), bad, started))
+        except BaseException as exc:
+            interrupted = isinstance(exc, KeyboardInterrupt)
+            self.budget.stop("interrupted" if interrupted else "error")
+            if interrupted:
+                self.log("Abbruch angefordert - keine neuen Anfragen mehr, "
+                         "warte auf die Antworten, die schon unterwegs sind")
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
         return failures
+
+    def _progress(self, number: int, done: int, total: int, bad: int, started: datetime) -> str:
+        now = self._now()
+        elapsed = (now - started).total_seconds()
+        rest = format_duration(elapsed / done * (total - done)) if elapsed > 0 else "?"
+        return (f"[R{number} {done}/{total}] {bad} fehlgeschlagen | "
+                f"{self.report.translated}/{self.report.todo} Texte | "
+                f"{self.client.stats['requests']} Anfragen | "
+                f"{now.astimezone():%H:%M:%S} | Rest ca. {rest}")
 
     # -- whole run -------------------------------------------------------------
     def run(self, units: Iterable[tuple[str, str]]) -> RunReport:
         started = self._now()
+        rep = self.report
+        try:
+            self._run(units)
+        except BaseException as exc:
+            self.budget.stop("interrupted" if isinstance(exc, KeyboardInterrupt) else "error")
+            raise
+        finally:
+            rep.left_open = rep.todo - rep.translated - rep.rejected - rep.unchanged
+            rep.requests = self.client.stats["requests"]
+            rep.stopped = self.budget.reason
+            rep.quota_remaining = self.budget.remaining
+            self._write_summary(started)
+            self.log(f"Ende: {rep.translated} uebersetzt, {rep.unchanged} unveraendert, "
+                     f"{rep.rejected} abgelehnt, {rep.left_open} offen, {rep.requests} Anfragen"
+                     + (f", gestoppt: {rep.stopped}" if rep.stopped else ""))
+        return rep
+
+    def _run(self, units: Iterable[tuple[str, str]]) -> None:
         rep = self.report
         unique = list(dict.fromkeys(units))
         rep.open_total = len(unique)
@@ -336,30 +452,23 @@ class Runner:
         rep.todo_texts = len(keys)
         self.log(f"Start: {rep.open_total} offen, {rep.already_cached} im Cache, "
                  f"{rep.skipped_rejects} bekannte Ablehner, {rep.skipped_unchanged} bekannt unveraendert, "
-                 f"{rep.todo} zu tun "
-                 f"({rep.todo_texts} verschiedene Texte)")
-        if keys:
-            self.budget.start()
-            if not self.budget.stopped:
-                first = self._round(1, list(keys), keys, self.opts.batch_items)
-                retry = [en for en, f in first.items() if f[0] != "skipped"]
-                if retry and not self.budget.stopped:
-                    second = self._round(2, retry, keys, self.opts.retry_items)
-                    for en, (reason, model, de) in second.items():
-                        if reason in ("batch", "skipped"):
-                            continue
-                        for key in keys[en]:
-                            self.rejects.add(key, en, reason, model=model, de=de)
-                        rep.rejected += len(keys[en])
-        rep.left_open = rep.todo - rep.translated - rep.rejected - rep.unchanged
-        rep.requests = self.client.stats["requests"]
-        rep.stopped = self.budget.reason
-        rep.quota_remaining = self.budget.remaining
-        self._write_summary(started)
-        self.log(f"Ende: {rep.translated} uebersetzt, {rep.unchanged} unveraendert, {rep.rejected} abgelehnt, "
-                 f"{rep.left_open} offen, {rep.requests} Anfragen"
-                 + (f", gestoppt: {rep.stopped}" if rep.stopped else ""))
-        return rep
+                 f"{rep.todo} zu tun ({rep.todo_texts} verschiedene Texte), {self.opts.workers} parallel")
+        if not keys:
+            return
+        self.budget.start()
+        if self.budget.stopped:
+            return
+        first = self._round(1, list(keys), keys, self.opts.batch_items)
+        retry = [en for en, f in first.items() if f[0] != "skipped"]
+        if not retry or self.budget.stopped:
+            return
+        second = self._round(2, retry, keys, self.opts.retry_items)
+        for en, (reason, model, de) in second.items():
+            if reason in ("batch", "skipped"):
+                continue
+            for key in keys[en]:
+                self.rejects.add(key, en, reason, model=model, de=de)
+            rep.rejected += len(keys[en])
 
     def _write_summary(self, started: datetime) -> None:
         summary = asdict(self.report)
@@ -375,3 +484,4 @@ class Runner:
         (self.log_dir / "last_run.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=1), encoding="utf-8"
         )
+

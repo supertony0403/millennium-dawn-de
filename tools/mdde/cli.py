@@ -12,9 +12,17 @@ from . import openrouter, scope
 from .build import md_version
 from .cache import RejectLog, TranslationCache, UnchangedLog
 from .config import Config
-from .translate import RunOptions, Runner, build_system_prompt, load_glossary, make_batches
+from .translate import (
+    RunOptions,
+    Runner,
+    build_system_prompt,
+    load_glossary,
+    make_batches,
+    sigterm_as_interrupt,
+)
 
-FATAL_STOPS = {"auth", "no-models", "error"}
+FATAL_STOPS = {"auth", "no-models", "error", "quota-unknown"}
+EXIT_INTERRUPTED = 130
 
 
 def fmt(n: int) -> str:
@@ -102,13 +110,20 @@ def cmd_translate(args: argparse.Namespace, cfg: Config) -> int:
             reserve=cfg.reserve,
             max_requests=args.max_requests,
             wait_for_reset=args.wait_for_reset,
+            allow_unknown_quota=args.allow_unknown_quota,
             retry_rejects=args.retry_rejects,
             retry_unchanged=args.retry_unchanged,
         ),
         log_dir=cfg.log_dir,
         unchanged=UnchangedLog(cfg.unchanged_path),
     )
-    report = runner.run((i.key, i.en) for i in items)
+    try:
+        with sigterm_as_interrupt():
+            report = runner.run((i.key, i.en) for i in items)
+    except KeyboardInterrupt:
+        print("Abgebrochen - alle bis dahin gueltigen Uebersetzungen sind im Cache gesichert.",
+              file=sys.stderr)
+        return EXIT_INTERRUPTED
     return 1 if report.stopped in FATAL_STOPS else 0
 
 

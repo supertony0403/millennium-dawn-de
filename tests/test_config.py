@@ -21,7 +21,7 @@ def test_defaults_point_to_repo_and_workshop_copy():
     assert cfg.output_dir == REPO / "localisation" / "german"
     assert cfg.translations_path == REPO / "cache" / "translations.jsonl"
     assert cfg.rejects_path == REPO / "cache" / "rejects.jsonl"
-    assert cfg.workers == 3
+    assert cfg.workers == 6
     assert cfg.reserve == 100
     assert cfg.models[0] == "nvidia/nemotron-3-super-120b-a12b:free"
 

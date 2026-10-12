@@ -24,6 +24,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-requests", type=int, default=None, metavar="N")
     p.add_argument("--wait-for-reset", action="store_true",
                    help="bei erschoepftem Kontingent bis 00:00 UTC schlafen und weitermachen")
+    p.add_argument("--allow-unknown-quota", action="store_true",
+                   help="auch laufen, wenn das Tageskontingent nicht abfragbar ist (ohne Reserve-Schutz)")
     p.add_argument("--retry-rejects", action="store_true",
                    help="auch Texte erneut versuchen, die schon in rejects.jsonl stehen")
     p.add_argument("--retry-unchanged", action="store_true",

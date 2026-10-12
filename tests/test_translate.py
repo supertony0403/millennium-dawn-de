@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import signal
+import threading
+import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -12,7 +16,14 @@ from fakes import FakeSleep, FakeTransport, completion, error
 
 from mdde.cache import RejectLog, TranslationCache
 from mdde.openrouter import Client
-from mdde.translate import RunOptions, Runner, build_system_prompt, load_glossary, make_batches
+from mdde.translate import (
+    RunOptions,
+    Runner,
+    build_system_prompt,
+    load_glossary,
+    make_batches,
+    sigterm_as_interrupt,
+)
 
 KEY = "sk-or-v1-runner-test-key"
 REPO = Path(__file__).resolve().parents[1]
@@ -388,3 +399,163 @@ def test_three_length_violations_discard_the_whole_package(tmp_path):
     env = Env(tmp_path, responder=responder)
     env.runner.run([(f"k{i}", en) for i, en in enumerate(texts)])
     assert env.cache.get("k3", texts[3]) == good[texts[3]]
+
+
+# -- review finding K1: the reserve is never undercut ---------------------------------
+class LiveQuota:
+    """Transport whose daily quota really drops by one per chat request."""
+
+    def __init__(self, remaining, key_fails_after=None):
+        self.remaining = self.lowest = remaining
+        self.key_calls = self.posts = 0
+        self.key_fails_after = key_fails_after
+        self.lock = threading.Lock()
+
+    def __call__(self, method, url, headers, body, timeout):
+        with self.lock:
+            if method == "GET":
+                self.key_calls += 1
+                if self.key_fails_after is not None and self.key_calls > self.key_fails_after:
+                    return error(500)
+                return quota_payload(self.remaining)
+            self.remaining -= 1
+            self.posts += 1
+            self.lowest = min(self.lowest, self.remaining)
+        batch = json.loads(json.loads(body)["messages"][1]["content"])
+        return completion({i: f"Satz {en}" for i, en in batch.items()})
+
+
+def live_runner(tmp_path, live, **opts):
+    client = Client(KEY, ["m1"], system_prompt="S", transport=live, sleep=FakeSleep())
+    opts.setdefault("batch_items", 1)
+    return Runner(client, TranslationCache(tmp_path / "t.jsonl"), RejectLog(tmp_path / "r.jsonl"),
+                  RunOptions(**opts), log_dir=tmp_path / "logs", sleep=FakeSleep(), out=lambda line: None)
+
+
+def sentences(n):
+    return [(f"k{i}", f"Unique english sentence number {i}") for i in range(n)]
+
+
+@pytest.mark.parametrize("start,workers", [(101, 1), (120, 1), (150, 1), (150, 3), (180, 6)])
+def test_reserve_is_never_undercut(tmp_path, start, workers):
+    live = LiveQuota(start)
+    report = live_runner(tmp_path, live, workers=workers, reserve=100).run(sentences(120))
+    assert live.lowest >= 100
+    assert report.stopped == "quota"
+    assert live.posts == max(0, start - 100 - workers)
+
+
+def test_unknown_quota_stops_before_any_request(tmp_path):
+    live = LiveQuota(1000, key_fails_after=0)
+    report = live_runner(tmp_path, live, workers=1).run(sentences(5))
+    assert live.posts == 0
+    assert report.stopped == "quota-unknown"
+
+
+def test_unknown_quota_can_be_allowed_explicitly(tmp_path):
+    live = LiveQuota(1000, key_fails_after=0)
+    report = live_runner(tmp_path, live, workers=1, allow_unknown_quota=True).run(sentences(5))
+    assert live.posts == 5
+    assert report.stopped is None
+
+
+def test_failing_quota_check_mid_run_keeps_counting_locally(tmp_path):
+    live = LiveQuota(130, key_fails_after=1)
+    report = live_runner(tmp_path, live, workers=1, reserve=100, quota_every=5).run(sentences(60))
+    assert live.lowest >= 100
+    assert report.stopped == "quota"
+
+
+# -- review finding K2: Ctrl+C and SIGTERM stop the run quickly -------------------------
+def slow_env(tmp_path, n=300):
+    def responder(payload):
+        time.sleep(0.005)
+        batch = json.loads(payload["messages"][1]["content"])
+        return completion({i: f"Satz {en}" for i, en in batch.items()})
+
+    env = Env(tmp_path, responder=responder, workers=3, batch_items=1)
+    return env, sentences(n)
+
+
+def interrupt_on_first_progress(action):
+    fired = []
+
+    def out(line):
+        if line.startswith("[R1") and not fired:
+            fired.append(line)
+            action()
+
+    return out
+
+
+def raise_keyboard_interrupt():
+    raise KeyboardInterrupt
+
+
+def test_ctrl_c_stops_queued_packages_and_writes_summary(tmp_path):
+    env, units = slow_env(tmp_path)
+    env.runner._out = interrupt_on_first_progress(raise_keyboard_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        env.runner.run(units)
+    assert len(env.chat_calls) <= 10  # before the fix: all 300
+    summary = json.loads((tmp_path / "logs" / "last_run.json").read_text())
+    assert summary["stopped"] == "interrupted"
+    assert summary["translated"] >= 1
+
+
+def test_sigterm_behaves_like_ctrl_c(tmp_path):
+    env, units = slow_env(tmp_path)
+    env.runner._out = interrupt_on_first_progress(lambda: signal.raise_signal(signal.SIGTERM))
+    before = signal.getsignal(signal.SIGTERM)
+    with pytest.raises(KeyboardInterrupt), sigterm_as_interrupt():
+        env.runner.run(units)
+    assert signal.getsignal(signal.SIGTERM) is before
+    assert len(env.chat_calls) <= 10
+    assert json.loads((tmp_path / "logs" / "last_run.json").read_text())["stopped"] == "interrupted"
+
+
+def test_stop_wakes_a_worker_waiting_for_rate_limits(tmp_path):
+    transport = FakeTransport(by_model={"m1": lambda payload: error(429, "rate-limited upstream")})
+
+    def route(method, url, headers, body, timeout):
+        return quota_payload(1000) if method == "GET" else transport(method, url, headers, body, timeout)
+
+    client = Client(KEY, ["m1"], system_prompt="S", transport=route, wait_schedule=(30,))  # real time.sleep
+    runner = Runner(client, TranslationCache(tmp_path / "t.jsonl"), RejectLog(tmp_path / "r.jsonl"),
+                    RunOptions(workers=1, batch_items=1), log_dir=tmp_path / "logs", out=lambda line: None)
+    threading.Timer(0.3, runner.budget.stop, args=("interrupted",)).start()
+    started = time.monotonic()
+    report = runner.run(sentences(1))
+    assert time.monotonic() - started < 5
+    assert report.stopped == "interrupted"
+
+
+def test_stop_wakes_a_run_waiting_for_the_daily_reset(tmp_path):
+    live = LiveQuota(0)
+    client = Client(KEY, ["m1"], system_prompt="S", transport=live)
+    runner = Runner(client, TranslationCache(tmp_path / "t.jsonl"), RejectLog(tmp_path / "r.jsonl"),
+                    RunOptions(workers=1, wait_for_reset=True), log_dir=tmp_path / "logs", out=lambda line: None)
+    threading.Timer(0.3, runner.budget.stop, args=("interrupted",)).start()
+    started = time.monotonic()
+    report = runner.run(sentences(1))
+    assert time.monotonic() - started < 5
+    assert report.stopped == "interrupted"
+    assert live.posts == 0
+
+
+# -- progress line ----------------------------------------------------------------------
+def test_progress_line_shows_clock_and_remaining_time(tmp_path):
+    env = Env(tmp_path, batch_items=1)
+    env.runner.run(sentences(3))
+    progress = [line for line in env.out if line.startswith("[R1 ")]
+    assert len(progress) == 3
+    assert all(re.search(r"\| \d\d:\d\d:\d\d \| Rest ca\. ", line) for line in progress), progress
+    started = env.now
+    env.now = started + timedelta(seconds=60)
+    assert env.runner._progress(1, 1, 3, 0, started).endswith("Rest ca. 2 min")
+    env.now = started + timedelta(hours=2)
+    assert env.runner._progress(1, 1, 3, 0, started).endswith("Rest ca. 4 h 00 min")
+
+
+def test_default_run_options_use_six_workers():
+    assert RunOptions().workers == 6

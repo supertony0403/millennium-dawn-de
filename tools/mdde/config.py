@@ -28,7 +28,7 @@ DEFAULT_MODELS: tuple[str, ...] = (
     "nvidia/nemotron-3-super-120b-a12b:free",
     "google/gemma-4-31b-it:free",
 )
-DEFAULT_WORKERS = 3
+DEFAULT_WORKERS = 6
 DEFAULT_RESERVE = 100
 
 
