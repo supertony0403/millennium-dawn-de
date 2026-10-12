@@ -109,9 +109,24 @@ def _stopword_hits(text: str) -> tuple[int, int]:
     return (sum(w in ENGLISH_STOPWORDS for w in found), sum(w in GERMAN_STOPWORDS for w in found))
 
 
+# A colour span taken over verbatim from the English text is only a kept name or
+# title if it is short and no sentence: whole English sentences in a span (MD's
+# red warnings, "§RThis will upset the populace!§!") are untranslated leftovers.
+TITLE_SPAN_MAX_WORDS = 6
+_SENTENCE_END_RE = re.compile(r"[.!?:;]\s*$")
+
+
+def _title_like(span: str) -> bool:
+    """``span`` (``§Y…§!``) reads like a name or title: <= 6 words, no sentence mark at the end."""
+    inner = span[2:-2]
+    return len(words(inner)) <= TITLE_SPAN_MAX_WORDS and not _SENTENCE_END_RE.search(inner)
+
+
 def _drop_kept_spans(en: str, de: str) -> str:
-    """``de`` without colour spans that occur verbatim in ``en`` (kept names/titles)."""
-    return _COLOUR_SPAN_RE.sub(lambda m: " " if m.group(0) in en else m.group(0), de)
+    """``de`` without title-like colour spans that occur verbatim in ``en`` (kept names/titles)."""
+    return _COLOUR_SPAN_RE.sub(
+        lambda m: " " if m.group(0) in en and _title_like(m.group(0)) else m.group(0), de
+    )
 
 
 def looks_english(en: str, de: str) -> bool:
@@ -123,8 +138,9 @@ def looks_english(en: str, de: str) -> bool:
       >= 25 % of the words and not a single German stop word.
 
     Proper names such as "Bank of Canada" contribute one stop word and pass;
-    words inside a colour span taken over unchanged from ``en``
-    (``§YThe Leader of the Free World§!``) are not counted.
+    words inside a short, title-like colour span taken over unchanged from
+    ``en`` (``§YThe Leader of the Free World§!``) are not counted - a kept
+    English sentence in a span (``§RThis will upset the populace!§!``) is.
     """
     de = _drop_kept_spans(en, de)
     found = words(de)

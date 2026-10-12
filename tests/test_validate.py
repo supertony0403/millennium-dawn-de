@@ -297,3 +297,24 @@ def test_english_in_a_changed_colour_span_still_counts():
     en = "Word §YWe are the champions of the world§! more words here"
     de = "Wort §YWe are the champions of our world§! weitere Wörter hier"
     assert check(en, de) == "english"
+
+
+# -- review 3, W3: only title-like kept spans are exempt; a kept English sentence is a leftover --
+@pytest.mark.parametrize(
+    "en,de",
+    [
+        # TT_AFGHANISTAN_NEW_ADMINISTRATION_KARZAI: the warning sentence was left in English
+        ("Establish a pro-western government led by a popular candidate. "
+         "§RThis will upset the more conservative populace!§!\\n",
+         "Errichte eine pro-westliche Regierung unter Führung eines populären Kandidaten. "
+         "§RThis will upset the more conservative populace!§!\\n"),
+        # short, but a sentence (ends with "!")
+        ("Annex the region. §RThey will hate us for this!§!",
+         "Die Region annektieren. §RThey will hate us for this!§!"),
+        # no sentence mark, but one word longer than a title (7 words; 6 pass, see above)
+        ("Form the government §YThe Council of Free and United Peoples§! today",
+         "Bilde die Regierung §YThe Council of Free and United Peoples§! heute"),
+    ],
+)
+def test_english_sentence_kept_in_a_colour_span_still_counts(en, de):
+    assert check(en, de) == "english"
