@@ -621,6 +621,17 @@ def test_emergency_switch_stops_at_once_without_another_model(tmp_path):
     assert len(env.chat_calls) == 6
 
 
+def test_late_answers_of_a_dropped_model_do_not_trip_the_switch_again(tmp_path):
+    runner, cache, calls = two_models(tmp_path, truncating, good_german)
+    for _ in range(6):
+        runner._note_package("m1", True)
+    assert runner.client.disabled == {"m1"}
+    for _ in range(5):  # still on the wire when m1 was dropped (6 workers)
+        runner._note_package("m1", True)
+    runner._note_package("m2", True)
+    assert not runner.budget.stopped
+
+
 def test_discard_stop_is_a_fatal_exit():
     from mdde.cli import FATAL_STOPS
 

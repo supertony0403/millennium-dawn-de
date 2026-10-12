@@ -467,6 +467,8 @@ class Runner:
     def _note_package(self, model: str | None, discarded: bool) -> None:
         """Emergency switch: too many discarded packages -> next model, then stop."""
         with self._stats_lock:
+            if model in self.client.disabled:
+                return  # late answers of a model the switch already dropped
             self._recent.append(discarded)
             bad = sum(self._recent)
             if bad * 2 <= DISCARD_WINDOW or self.budget.stopped:
