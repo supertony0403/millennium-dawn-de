@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
 from collections import Counter
-from pathlib import Path
 
+from . import build as buildmod
 from . import openrouter, scope
+from .build import md_version
 from .cache import RejectLog, TranslationCache
 from .config import Config
 from .translate import RunOptions, Runner, build_system_prompt, load_glossary, make_batches
@@ -18,15 +18,6 @@ FATAL_STOPS = {"auth", "no-models", "error"}
 
 def fmt(n: int) -> str:
     return f"{n:,}".replace(",", ".")
-
-
-def md_version(md_root: Path) -> str | None:
-    try:
-        text = (md_root / "descriptor.mod").read_text(encoding="utf-8-sig", errors="replace")
-    except OSError:
-        return None
-    m = re.search(r'^\s*version\s*=\s*"([^"]*)"', text, re.M)
-    return m.group(1) if m else None
 
 
 def _client(cfg: Config, system_prompt: str = "") -> openrouter.Client:
@@ -109,6 +100,31 @@ def cmd_translate(args: argparse.Namespace, cfg: Config) -> int:
     return 1 if report.stopped in FATAL_STOPS else 0
 
 
+def cmd_build(args: argparse.Namespace, cfg: Config) -> int:
+    cache = TranslationCache(cfg.translations_path)
+    report = buildmod.build(cfg.md_root, cfg.output_dir, cache, info_path=cfg.build_info_path)
+    print(f"Build: {report.files} Dateien ({report.mirrored} gespiegelt, {report.new_files} neu) "
+          f"-> {cfg.output_dir}")
+    print(f"  {fmt(report.replaced)} Werte uebersetzt, {fmt(report.appended)} Schluessel angehaengt, "
+          f"{fmt(report.english_fallback)} Werte noch englisch (alle Scopes und Dateien, Cache: {fmt(len(cache))})")
+    if report.skipped_empty:
+        print(f"  uebersprungen (englische Datei ohne Eintraege): {', '.join(report.skipped_empty)}")
+    return 0
+
+
+def cmd_check(args: argparse.Namespace, cfg: Config) -> int:
+    report = buildmod.check(cfg.md_root, cfg.output_dir, info_path=cfg.build_info_path)
+    print(f"Check: {report.files} Dateien, {fmt(report.checked_values)} geaenderte Werte geprueft, "
+          f"{len(report.errors)} Fehler, {len(report.warnings)} Warnungen")
+    for line in report.errors[:50]:
+        print(f"  FEHLER  {line}")
+    if len(report.errors) > 50:
+        print(f"  ... und {len(report.errors) - 50} weitere Fehler")
+    for line in report.warnings:
+        print(f"  WARNUNG {line}")
+    return report.exit_code
+
+
 def _not_implemented(args: argparse.Namespace, cfg: Config) -> int:
     print(f"'{args.command}' ist noch nicht implementiert", file=sys.stderr)
     return 3
@@ -117,8 +133,8 @@ def _not_implemented(args: argparse.Namespace, cfg: Config) -> int:
 HANDLERS = {
     "status": cmd_status,
     "translate": cmd_translate,
-    "build": _not_implemented,
-    "check": _not_implemented,
+    "build": cmd_build,
+    "check": cmd_check,
     "install": _not_implemented,
 }
 
