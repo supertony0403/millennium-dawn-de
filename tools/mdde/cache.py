@@ -125,15 +125,20 @@ class UnchangedLog(_JsonlLog):
 
     They are kept out of the translation cache, so the English text stays in
     the game, and are not requested again unless ``--retry-unchanged`` is used.
+    ``translatable: true`` marks a text that still looked translatable but got
+    no second chance (the run ended before round two); one line per text.
     """
 
     def __init__(self, path: Path) -> None:
         super().__init__(path)
         self._known: set[tuple[str, str]] = set()
+        self._translatable: set[tuple[str, str]] = set()
         for record in self._records():
             key, sha = record.get("key"), record.get("src_sha1")
             if isinstance(key, str) and isinstance(sha, str):
                 self._known.add((key, sha))
+                if record.get("translatable") is True:
+                    self._translatable.add((key, sha))
 
     def __len__(self) -> int:
         return len(self._known)
@@ -141,11 +146,23 @@ class UnchangedLog(_JsonlLog):
     def contains(self, key: str, en: str) -> bool:
         return (key, src_hash(en)) in self._known
 
-    def add(self, key: str, en: str, model: str | None = None) -> None:
+    def is_translatable(self, key: str, en: str) -> bool:
+        """Logged with the ``translatable`` mark (no second chance in its run)."""
+        return (key, src_hash(en)) in self._translatable
+
+    def add(self, key: str, en: str, model: str | None = None, *, translatable: bool = False) -> None:
+        """Log ``key``/``en`` once; a text already in the log is not written again."""
         sha = src_hash(en)
-        self._append({"key": key, "src_sha1": sha, "model": model, "ts": _now()})
         with self._lock:
+            if (key, sha) in self._known:
+                return
             self._known.add((key, sha))
+            if translatable:
+                self._translatable.add((key, sha))
+        record = {"key": key, "src_sha1": sha, "model": model, "ts": _now()}
+        if translatable:
+            record["translatable"] = True
+        self._append(record)
 
 
 

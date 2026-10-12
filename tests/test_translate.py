@@ -552,6 +552,59 @@ def test_retry_unchanged_can_be_limited_to_translatable_texts(tmp_path, mode, ex
     assert sorted(en for _, batch in calls for en in batch) == expected
 
 
+# -- review 3, K3: no second chance -> unchanged log, marked "translatable" ---------------
+def unchanged_records(tmp_path):
+    path = tmp_path / "cache" / "unchanged.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+@pytest.mark.parametrize("batch_items", [1, 2])  # stop inside round one / just before round two
+def test_translatable_unchanged_text_is_logged_when_the_run_ends_before_round_two(tmp_path, batch_items):
+    runner, cache, calls = two_models(tmp_path, echo, echo, max_requests=1, batch_items=batch_items)
+    report = runner.run([("tog", TOGGLE), ("opp", "Opposition")])
+    assert [model for model, _ in calls] == ["m1"]
+    records = {r["key"]: r for r in unchanged_records(tmp_path)}
+    assert records["tog"]["translatable"] is True and records["tog"]["model"] == "m1"
+    assert report.unchanged == len(records) and report.left_open == 2 - len(records)
+    again, _, calls_again = two_models(tmp_path, echo, echo)
+    again.run([("tog", TOGGLE)])
+    assert calls_again == []  # before the fix: asked again in every run
+
+
+def test_translatable_text_rejected_in_round_two_stays_out_of_the_unchanged_log(tmp_path):
+    runner, cache, calls = two_models(tmp_path, echo, lambda batch: {i: "kaputt" for i in batch})
+    report = runner.run([("tog", TOGGLE)])
+    assert [model for model, _ in calls] == ["m1", "m2"]
+    assert report.rejected == 1 and report.unchanged == 0 and report.left_open == 0
+    assert unchanged_records(tmp_path) == []
+
+
+def test_translatable_unchanged_text_is_logged_when_the_run_is_interrupted(tmp_path):
+    runner, cache, calls = two_models(tmp_path, echo, echo, batch_items=1)
+    runner._out = interrupt_on_first_progress(raise_keyboard_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        runner.run([("tog", TOGGLE), ("tog2", "§YToggle the other decisions§!")])
+    records = unchanged_records(tmp_path)  # tog2 may have been on the wire already
+    assert "tog" in {r["key"] for r in records} and all(r["translatable"] for r in records)
+    summary = json.loads((tmp_path / "logs" / "last_run.json").read_text())
+    assert summary["unchanged"] == len(records)
+
+
+def test_retry_unchanged_translatable_writes_no_duplicate_lines(tmp_path):
+    for _ in range(3):
+        runner, cache, calls = two_models(tmp_path, echo, echo, retry_unchanged="translatable")
+        runner.run([("tog", TOGGLE), ("opp", "Opposition")])
+    assert sorted(r["key"] for r in unchanged_records(tmp_path)) == ["opp", "tog"]
+
+
+def test_retry_unchanged_translatable_asks_texts_marked_translatable(tmp_path):
+    log = UnchangedLog(tmp_path / "cache" / "unchanged.jsonl")
+    log.add("opp", "Opposition", "m1", translatable=True)  # no second chance in its run
+    runner, cache, calls = two_models(tmp_path, german, german, retry_unchanged="translatable")
+    runner.run([("opp", "Opposition")])
+    assert calls == [("m1", ["Opposition"])]
+
+
 # -- review 2, k-1: bounded split costs and an emergency switch -----------------------------
 def moderating(flagged):
     def respond(payload):

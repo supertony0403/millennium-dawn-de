@@ -149,3 +149,23 @@ def test_run_lock_is_exclusive(tmp_path):
                 pass
     with run_lock(lock):  # released again
         pass
+
+
+# -- review 3, K3: one line per text; the "translatable" mark survives a reload ---------
+def test_unchanged_log_keeps_one_line_per_text(tmp_path):
+    path = tmp_path / "unchanged.jsonl"
+    log = UnchangedLog(path)
+    log.add("k", "Toggle", "m1")
+    log.add("k", "Toggle", "m2")
+    UnchangedLog(path).add("k", "Toggle", "m1", translatable=True)
+    assert len(path.read_text().splitlines()) == 1
+
+
+def test_unchanged_log_remembers_the_translatable_mark(tmp_path):
+    path = tmp_path / "unchanged.jsonl"
+    UnchangedLog(path).add("k", "Toggle the decisions", "m1", translatable=True)
+    UnchangedLog(path).add("o", "Opposition", "m1")
+    log = UnchangedLog(path)
+    assert log.is_translatable("k", "Toggle the decisions")
+    assert not log.is_translatable("o", "Opposition")
+    assert not log.is_translatable("k", "changed English text")

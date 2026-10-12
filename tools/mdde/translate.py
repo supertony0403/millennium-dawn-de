@@ -8,9 +8,12 @@ Flow per run:
    parallel; every valid answer goes to the cache immediately, answers equal
    to the English text go to the unchanged log instead (not requested again
    unless ``retry_unchanged`` is ``"all"`` - or ``"translatable"`` for those
-   that ``validate.looks_translatable``) - except texts that obviously still
-   need German: they are asked again in round two, with the next model of the
-   chain first, and only an unchanged answer there goes to the log;
+   that ``validate.looks_translatable`` or carry the ``translatable`` mark) -
+   except texts that obviously still need German: they are asked again in
+   round two, with the next model of the chain first, and only an unchanged
+   answer there goes to the log. If the run ends before they got that second
+   chance (quota, ``--max-requests``, Ctrl+C), they go to the log marked
+   ``translatable`` instead of being asked again in every run;
 3. a package whose answers look shifted (>= 3 length-ratio violations,
    >= 2 answers that fit a neighbouring text but not their own, or answer
    lengths that match the neighbouring texts far better than their own) is
@@ -409,6 +412,9 @@ class Runner:
         self.report = RunReport()
         self._recent: deque[bool] = deque(maxlen=DISCARD_WINDOW)  # discarded?, per package
         self._trips = 0
+        # translatable texts answered unchanged in round one, until round two settles them:
+        # en -> (model, keys)
+        self._second_chance: dict[str, tuple[str | None, list[str]]] = {}
 
     # -- logging -------------------------------------------------------------
     def log(self, line: str) -> None:
@@ -547,11 +553,14 @@ class Runner:
             reason = validate.check(en, de)
             if reason == "unchanged" and not final and validate.looks_translatable(en):
                 failures[en] = (reason, result.model, de)  # second chance, other model first
+                with self._stats_lock:
+                    self._second_chance[en] = (result.model, keys[en])
             elif reason == "unchanged":
                 for key in keys[en]:
                     self.unchanged.add(key, en, result.model)
                 with self._stats_lock:
                     self.report.unchanged += len(keys[en])
+                    self._second_chance.pop(en, None)
             elif reason is not None:
                 failures[en] = (reason, result.model, de)
             else:
@@ -559,6 +568,7 @@ class Runner:
                     self.cache.put(key, en, de, result.model or "")
                 with self._stats_lock:
                     self.report.translated += len(keys[en])
+                    self._second_chance.pop(en, None)
         return failures
 
     def _round(self, number: int, groups: Mapping[str | None, list[str]], keys: Mapping[str, list[str]],
@@ -621,6 +631,7 @@ class Runner:
             self.budget.stop("interrupted" if isinstance(exc, KeyboardInterrupt) else "error")
             raise
         finally:
+            self._log_missed_second_chances()
             rep.left_open = rep.todo - rep.translated - rep.rejected - rep.unchanged
             rep.requests = self.client.stats["requests"]
             rep.stopped = self.budget.reason
@@ -644,7 +655,8 @@ class Runner:
                 rep.skipped_rejects += 1
             elif self.unchanged.contains(key, en) and not (
                     mode is True or mode == "all"
-                    or (mode == "translatable" and validate.looks_translatable(en))):
+                    or (mode == "translatable" and (validate.looks_translatable(en)
+                                                    or self.unchanged.is_translatable(key, en)))):
                 rep.skipped_unchanged += 1
             else:
                 keys.setdefault(en, []).append(key)
@@ -675,6 +687,22 @@ class Runner:
             for key in keys[en]:
                 self.rejects.add(key, en, reason, model=model, de=de)
             self.report.rejected += len(keys[en])
+            self._second_chance.pop(en, None)
+
+    def _log_missed_second_chances(self) -> None:
+        """Translatable texts answered unchanged in round one that round two never
+        settled (the run ended before it, or their package was skipped or failed
+        there) go to the unchanged log marked ``translatable`` - otherwise every
+        run would ask them again. ``--retry-unchanged=translatable`` finds them."""
+        with self._stats_lock:
+            missed, self._second_chance = self._second_chance, {}
+        for en, (model, keys) in missed.items():
+            for key in keys:
+                self.unchanged.add(key, en, model, translatable=True)
+            self.report.unchanged += len(keys)
+        if missed:
+            self.log(f"{len(missed)} unveraenderte, aber uebersetzbar wirkende Texte ohne zweite Runde "
+                     f"-> unchanged.jsonl (markiert, --retry-unchanged=translatable fragt sie erneut)")
 
     def _write_summary(self, started: datetime) -> None:
         summary = asdict(self.report)

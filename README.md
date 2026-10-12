@@ -60,7 +60,10 @@ Lange Übersetzungsläufe vor dem Standby schützen:
    angefragt. Wirkt ein solcher Text noch übersetzbar (kleingeschriebene oder englische
    Funktionswörter wie „of“, „the“, „Toggle“, „Cost“, Formatierung plus Wörter), fragt
    Runde zwei ihn zuerst beim nächsten Modell der Kette erneut an; erst wenn er auch dort
-   unverändert bleibt, kommt er nach `unchanged.jsonl`. Eigennamen („ExxonMobil“,
+   unverändert bleibt, kommt er nach `unchanged.jsonl`. Endet der Lauf vor dieser zweiten
+   Chance (Kontingent, `--max-requests`, Strg+C), kommt er ebenfalls dorthin, markiert mit
+   `"translatable": true` – `--retry-unchanged=translatable` fragt ihn erneut an, sonst
+   bleibt er wie jeder unveränderte Text liegen (eine Zeile je Text). Eigennamen („ExxonMobil“,
    „Maghreb“, „Opposition“) gehen direkt dorthin. Ungültige Texte bekommen eine zweite Runde
    in kleinen Paketen, danach landen sie in `cache/rejects.jsonl` (im Spiel bleibt dann der
    englische Text stehen). Ein Paket, dessen Antworten verschoben wirken, wird ganz
@@ -123,7 +126,7 @@ der Reserve oder `--max-requests` ist kein Fehler.
 | `tools/mdde/` | Python-Paket (`config`, `locfile`, `scope`, `cache`, `validate`, `openrouter`, `translate`, `revalidate`, `build`, `install`, `cli`) |
 | `cache/translations.jsonl` | Übersetzungs-Cache (append-only, Treffer nur bei gleichem SHA-1 des englischen Textes) |
 | `cache/rejects.jsonl` | Texte, die auch nach der zweiten Runde ungültig waren (mit Grund) |
-| `cache/unchanged.jsonl` | Texte, die das Modell unverändert zurückgab (Schlüssel + SHA-1) |
+| `cache/unchanged.jsonl` | Texte, die das Modell unverändert zurückgab (Schlüssel + SHA-1; `translatable: true` = ohne zweite Runde) |
 | `cache/translate.lock` | Sperre gegen parallele Läufe |
 | `logs/translate.log`, `logs/last_run.json` | Fortschritt und Abschlussbericht des letzten Laufs (nicht im Repo) |
 | `localisation/german/` | generierte Ausgabe (nicht von Hand bearbeiten – `build` überschreibt sie) |
