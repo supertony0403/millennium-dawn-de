@@ -13,8 +13,10 @@ Plan: `docs/superpowers/plans/2026-10-12-millennium-dawn-de-plan.md`
 
 | Scope | Inhalt | offene Texte (MD 2.0.2) |
 |---|---|---|
-| `germany` (Standard) | alles außer fremden Fokusbäumen (`MD_focus_<TAG>`), Namenslisten und Schlüsseln mit fremdem Länderkürzel (`RUS_…`, `USA.…`) – Ausnahme `countries`/`countries_cosmetic` | ≈ 37.500 |
-| `full` | alles außer Namenslisten (`victory_points`, `state_names`, `MD_terrain_cities`, `strategic_region_names`, `supply_area_names`) | ≈ 175.000 |
+| `germany` (Standard) | alles außer fremden Fokusbäumen (`MD_focus_<TAG>`), Namenslisten und Schlüsseln mit fremdem Länderkürzel (`RUS_…`, `USA.…`) – Ausnahme Ländernamen-Dateien (`countries`, `MD_countries_cosmetic`, `replaced_from_vanilla_countries_cosmetic`) | 39.411 (32.689 verschiedene Texte, ≈ 440 Anfragen) |
+| `full` | alles außer Namenslisten (`victory_points`, `state_names`, `MD_terrain_cities`, `strategic_region_names`, `supply_area_names`) | 175.203 (≈ 2.080 Anfragen) |
+
+Gleiche englische Texte unter verschiedenen Schlüsseln werden nur einmal angefragt.
 
 „Offen“ ist ein englischer Text, dessen deutscher Wert bei Millennium Dawn fehlt oder
 identisch mit dem englischen ist und der ohne Formatierungs-Tokens noch mindestens drei
@@ -58,6 +60,21 @@ Lange Übersetzungsläufe vor dem Standby schützen:
    `dlc_load.json`. Mehrfach ausführbar.
 
 Nach einem Update von Millennium Dawn: `status` → `translate` → `build` → `check`.
+
+Exit-Codes: `check` 0 = in Ordnung, 1 = Fehler in der Ausgabe, 2 = Build veraltet
+(Millennium Dawn hat sich seit dem letzten `build` geändert). `translate` endet mit 1 nur bei
+Schlüssel-/Modellfehlern; ein Stopp wegen Kontingent oder `--max-requests` ist kein Fehler.
+
+## Dateien
+
+| Pfad | Inhalt |
+|---|---|
+| `tools/mdde/` | Python-Paket (`config`, `locfile`, `scope`, `cache`, `validate`, `openrouter`, `translate`, `build`, `install`, `cli`) |
+| `cache/translations.jsonl` | Übersetzungs-Cache (append-only, Treffer nur bei gleichem SHA-1 des englischen Textes) |
+| `cache/rejects.jsonl` | Texte, die auch nach der zweiten Runde ungültig waren |
+| `logs/translate.log`, `logs/last_run.json` | Fortschritt und Abschlussbericht des letzten Laufs (nicht im Repo) |
+| `localisation/german/` | generierte Ausgabe (nicht von Hand bearbeiten – `build` überschreibt sie) |
+| `build_info.json` | MD-Version, Fingerabdruck der MD-Lokalisierung, Zahlen des letzten Builds |
 
 ## Konfiguration (Umgebungsvariablen)
 
