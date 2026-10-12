@@ -59,8 +59,11 @@ Lange Übersetzungsläufe vor dem Standby schützen:
    verworfen und kleiner wiederholt; sperrt die Inhaltsmoderation des Anbieters ein Paket
    (HTTP 403 mit Moderationsdaten), wird es geteilt, bis der eine Text isoliert ist – der
    kommt mit Grund `moderation` in die Ablehnungen, das Modell bleibt in der Kette.
-   Das Tageskontingent wird zwischen den Abfragen lokal heruntergezählt; der Lauf stoppt,
-   bevor die Reserve angetastet wird. Ist das Kontingent nicht abfragbar, startet der Lauf
+   Das Tageskontingent wird alle 10 Anfragen abgefragt und dazwischen lokal
+   heruntergezählt, nahe der Reserve vor jeder Anfrage; der Lauf stoppt, bevor die Reserve
+   angetastet wird – nach bestem Bemühen: Was andere Programme mit demselben Schlüssel
+   (z. B. der Discord-Bot) verbrauchen, wird gemessen und vorausgeschätzt, ein verzögert
+   zu hoher Serverwert hebt die Schätzung nie an; eine Garantie ist das nicht. Ist das Kontingent nicht abfragbar, startet der Lauf
    gar nicht erst (außer mit `--allow-unknown-quota`). Strg+C oder SIGTERM: keine neuen
    Anfragen mehr, laufende Antworten werden noch gesichert. Es läuft immer nur ein
    `translate` gleichzeitig (Sperre `cache/translate.lock`). Die Fortschrittszeile zeigt
@@ -118,7 +121,7 @@ der Reserve oder `--max-requests` ist kein Fehler.
 | `MDDE_HOI4_DIR` | `~/.local/share/Paradox Interactive/Hearts of Iron IV` |
 | `MDDE_MODELS` | `nvidia/nemotron-3-super-120b-a12b:free,google/gemma-4-31b-it:free` |
 | `MDDE_WORKERS` | `6` parallele Anfragen |
-| `MDDE_RESERVE` | `100` Gratis-Anfragen bleiben für andere Programme übrig |
+| `MDDE_RESERVE` | `100` Gratis-Anfragen bleiben für andere Programme übrig (nach bestem Bemühen) |
 | `MDDE_CACHE_DIR` | `cache/` dieses Repositorys (z. B. auf eine Kopie zeigen lassen) |
 | `MDDE_VANILLA_DE` | `/mnt/steam-library/SteamLibrary/steamapps/common/Hearts of Iron IV/localisation/german` |
 

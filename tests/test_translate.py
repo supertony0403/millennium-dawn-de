@@ -246,10 +246,11 @@ def test_quota_at_or_below_reserve_stops_before_any_request(tmp_path):
 
 
 def test_quota_is_rechecked_every_n_requests(tmp_path):
-    env = Env(tmp_path, quotas=(10, 10, 1), reserve=5, quota_every=2, batch_items=1)
-    report = env.runner.run(five_texts())
-    assert len(env.chat_calls) == 4
-    assert env.quota_calls == 3
+    # start, after the first request (measures other programs), then every 2
+    env = Env(tmp_path, quotas=(20, 19, 17, 1), reserve=5, quota_every=2, batch_items=1)
+    report = env.runner.run(sentences(10))
+    assert len(env.chat_calls) == 5
+    assert env.quota_calls == 4
     assert report.stopped == "quota"
 
 
@@ -403,12 +404,19 @@ def test_three_length_violations_discard_the_whole_package(tmp_path):
 
 # -- review finding K1: the reserve is never undercut ---------------------------------
 class LiveQuota:
-    """Transport whose daily quota really drops by one per chat request."""
+    """Transport whose daily quota really drops by one per chat request.
 
-    def __init__(self, remaining, key_fails_after=None):
+    ``external`` extra requests of other programs (same key) are counted with
+    every chat request; ``lag`` makes ``/key`` report the value from that many
+    chat requests ago (a delayed, too high server value).
+    """
+
+    def __init__(self, remaining, key_fails_after=None, external=0, lag=0):
         self.remaining = self.lowest = remaining
         self.key_calls = self.posts = 0
         self.key_fails_after = key_fails_after
+        self.external, self.lag = external, lag
+        self.history = [remaining]
         self.lock = threading.Lock()
 
     def __call__(self, method, url, headers, body, timeout):
@@ -417,9 +425,10 @@ class LiveQuota:
                 self.key_calls += 1
                 if self.key_fails_after is not None and self.key_calls > self.key_fails_after:
                     return error(500)
-                return quota_payload(self.remaining)
-            self.remaining -= 1
+                return quota_payload(self.history[max(0, len(self.history) - 1 - self.lag)])
+            self.remaining -= 1 + self.external
             self.posts += 1
+            self.history.append(self.remaining)
             self.lowest = min(self.lowest, self.remaining)
         batch = json.loads(json.loads(body)["messages"][1]["content"])
         return completion({i: f"Satz {en}" for i, en in batch.items()})
@@ -443,6 +452,71 @@ def test_reserve_is_never_undercut(tmp_path, start, workers):
     assert live.lowest >= 100
     assert report.stopped == "quota"
     assert live.posts == max(0, start - 100 - workers)
+
+
+def test_default_quota_check_interval_is_ten_requests():
+    assert RunOptions().quota_every == 10
+
+
+@pytest.mark.parametrize("start", [130, 150, 200, 400])
+def test_reserve_holds_when_another_program_uses_the_same_key(tmp_path, start):
+    # review 2, W-1: the Discord bot spends one request for each of ours
+    live = LiveQuota(start, external=1)
+    report = live_runner(tmp_path, live, workers=1, reserve=100).run(sentences(400))
+    assert live.lowest >= 100
+    assert live.posts > 0
+    assert report.stopped == "quota"
+
+
+@pytest.mark.parametrize("external", [2, 3])
+@pytest.mark.parametrize("start", [120, 131, 150, 187, 260, 403])
+def test_reserve_holds_when_another_program_is_busier_than_we_are(tmp_path, external, start):
+    # simulation E of review 2: the bot sends ~3 requests per request of ours
+    live = LiveQuota(start, external=external)
+    report = live_runner(tmp_path, live, workers=1, reserve=100).run(sentences(500))
+    assert live.lowest >= 100
+    assert live.posts > 0
+    assert report.stopped == "quota"
+
+
+@pytest.mark.parametrize("workers", [3, 6])
+def test_reserve_holds_with_parallel_workers_and_a_busy_bot(tmp_path, workers):
+    live = LiveQuota(300, external=2)
+    live_runner(tmp_path, live, workers=workers, reserve=100).run(sentences(500))
+    assert live.lowest >= 100
+    assert live.posts > 0
+
+
+def test_close_to_the_reserve_the_quota_is_checked_before_every_request(tmp_path):
+    live = LiveQuota(130)
+    live_runner(tmp_path, live, workers=1, reserve=100).run(sentences(400))
+    # threshold 100 + 1 worker; /key at the start, after the first request, after
+    # 10 more and before every request once the estimate is <= 111 (used 19 ... 29)
+    assert live.posts == 29
+    assert live.key_calls == 1 + 2 + 11
+
+
+def test_a_delayed_higher_quota_never_raises_the_estimate(tmp_path):
+    live = LiveQuota(150, lag=15)
+    report = live_runner(tmp_path, live, workers=1, reserve=100).run(sentences(400))
+    assert live.lowest >= 100
+    assert report.stopped == "quota"
+
+
+def test_a_new_utc_day_accepts_the_higher_quota(tmp_path):
+    from mdde.translate import Budget
+
+    values = [200, 199, 500]
+    day = [datetime(2026, 10, 12, 23, 59, tzinfo=timezone.utc)]
+    budget = Budget(lambda: {"remaining": values.pop(0)}, RunOptions(workers=1, reserve=100), None,
+                    lambda: day[0], lambda line: None)
+    budget.start()
+    for _ in range(5):
+        budget()
+    assert budget.estimate() == 195
+    day[0] = datetime(2026, 10, 13, 0, 1, tzinfo=timezone.utc)
+    budget._check_quota()
+    assert budget.estimate() == 500
 
 
 def test_unknown_quota_stops_before_any_request(tmp_path):

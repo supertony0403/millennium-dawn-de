@@ -18,12 +18,15 @@ Flow per run:
    round two: invalid or failed texts again in packages of 10; texts that are
    still invalid go to the reject log (the English text stays in the game);
 5. a budget (``Budget``) guards every request: ``--max-requests`` and the
-   free daily quota. The quota is queried at the start and every 50 requests
-   and counted down locally in between; once the estimate reaches
-   ``reserve + workers`` it is queried again and the run stops there, so the
-   reserve for other applications is never used up (requests that are still
-   in flight are covered by ``workers``). An unknown quota stops the run
-   unless ``allow_unknown_quota`` is set;
+   free daily quota. The quota is queried at the start and every 10 requests
+   and counted down locally in between; within ``quota_every`` of
+   ``reserve + workers`` it is queried before *every* request, and the run
+   stops once the estimate reaches ``reserve + workers`` (requests still in
+   flight are covered by ``workers``). Within one UTC day a server value never
+   raises the local estimate (``/key`` may lag behind). Other programs using
+   the same key between two queries can still eat into the reserve, so it is
+   kept on a best-effort basis ("nach bestem Bemuehen"), not guaranteed. An
+   unknown quota stops the run unless ``allow_unknown_quota`` is set;
 6. Ctrl+C (and SIGTERM inside ``sigterm_as_interrupt``) stops the run: queued
    packages are cancelled, waiting workers wake up, requests already on the
    wire finish and are cached, ``logs/last_run.json`` is written.
@@ -101,7 +104,7 @@ class RunOptions:
     max_requests: int | None = None
     wait_for_reset: bool = False
     allow_unknown_quota: bool = False
-    quota_every: int = 50
+    quota_every: int = 10
     batch_chars: int = 9000
     batch_items: int = 100
     retry_items: int = 10
@@ -140,6 +143,14 @@ class Budget:
     ``_lock`` serialises the accounting of requests and the quota queries;
     ``stop`` never takes it, so a stop request is never blocked by a worker
     that sleeps until the daily reset while holding it.
+
+    Other programs may use the same key (the Discord bot). Every query
+    compares the server value with what our own requests explain; the
+    difference per own request is the *external rate* (highest value of the
+    UTC day). Between two queries the estimate subtracts our requests plus
+    the expected external ones, and the stop threshold covers the requests in
+    flight together with the external requests made meanwhile. The second
+    query comes after the first request, so the rate is known early.
     """
 
     def __init__(self, quota: Callable[[], dict | None], opts: RunOptions,
@@ -153,8 +164,11 @@ class Budget:
         self.used = 0
         self.reason: str | None = None
         self.remaining: int | None = None  # last value reported by /key
-        self._base: int | None = None  # remaining at the last successful query
+        self._base: int | None = None  # upper bound of remaining at the last successful query
+        self._base_day = None  # UTC date of ``_base``
         self._used_at_check = 0
+        self._rate = 0.0  # highest external requests per own request seen this UTC day
+        self._measured = False  # rate measured over at least one own request today
         self.generation = 0
 
     @property
@@ -163,14 +177,17 @@ class Budget:
 
     @property
     def threshold(self) -> int:
-        """Estimated quota at which the run stops: reserve + requests in flight."""
-        return self.opts.reserve + self.opts.workers
+        """Estimated quota at which the run stops: reserve + requests in flight
+        (and the external requests expected while they are on the way)."""
+        return self.opts.reserve + math.ceil(self.opts.workers * (1 + self._rate))
 
     def estimate(self) -> int | None:
-        """Quota left: last queried value minus the requests sent since then."""
+        """Quota left: last queried value minus our requests since then and the
+        requests other programs are expected to have made meanwhile."""
         if self._base is None:
             return None
-        return self._base - (self.used - self._used_at_check)
+        sent = self.used - self._used_at_check
+        return self._base - sent - math.ceil(sent * self._rate)
 
     def stop(self, reason: str) -> None:
         with self._reason_lock:
@@ -193,8 +210,10 @@ class Budget:
                 self.stop("max-requests")
             if not self.stopped:
                 estimate = self.estimate()
-                due = self.used and self.used % self.opts.quota_every == 0
-                if due or (estimate is not None and estimate <= self.threshold):
+                sent = self.used - self._used_at_check
+                due = sent >= (self.opts.quota_every if self._measured else 1)
+                near = estimate is not None and estimate <= self.threshold + self.opts.quota_every
+                if due or near:
                     self._check_quota()
             if self.reason is not None:
                 raise StopRun(self.reason)
@@ -218,8 +237,7 @@ class Budget:
             info = self._quota()
             remaining = info.get("remaining") if info else None
             if isinstance(remaining, int) and not isinstance(remaining, bool):
-                self.remaining = self._base = remaining
-                self._used_at_check = self.used
+                self._accept(remaining)
             elif self._base is None:
                 if self.opts.allow_unknown_quota:
                     self._log("Tageskontingent unbekannt - fahre ohne Kontingentpruefung fort "
@@ -238,11 +256,29 @@ class Budget:
             if estimate > self.threshold:
                 return
             self._log(f"Tageskontingent {estimate} <= Reserve {self.opts.reserve} "
-                      f"+ {self.opts.workers} parallele Anfragen")
+                      f"+ {self.threshold - self.opts.reserve} (parallele Anfragen"
+                      + (f", Fremdnutzung {self._rate:.1f} je eigene Anfrage)" if self._rate else ")"))
             if not self.opts.wait_for_reset or attempt == MAX_RESET_WAITS:
                 self.stop("quota")
                 return
             self._sleep_until_reset()
+
+    def _accept(self, remaining: int) -> None:  # lock held
+        """Take a server value; within one UTC day it may only lower the estimate."""
+        self.remaining = remaining
+        day = self._now().date()
+        sent = self.used - self._used_at_check
+        if self._base is not None and day == self._base_day:
+            bound = self._base - sent  # our own requests are certainly gone
+            if sent:
+                external = bound - remaining
+                self._rate = max(self._rate, external / sent if external > 0 else 0.0)
+                self._measured = True
+            remaining = min(remaining, bound)  # a lagging /key must not raise it
+        else:  # first query or a new UTC day
+            self._rate, self._measured = 0.0, False
+        self._base, self._base_day = remaining, day
+        self._used_at_check = self.used
 
     def _sleep_until_reset(self) -> None:  # lock held
         now = self._now()
