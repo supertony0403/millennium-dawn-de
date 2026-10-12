@@ -1,0 +1,14 @@
+[project]
+name = "mdde"
+version = "1.0.0"
+description = "Translation pipeline for the German Millennium Dawn (HOI4) localisation submod"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+pythonpath = ["tools"]
+testpaths = ["tests"]
+addopts = "-ra -p no:asyncio"
