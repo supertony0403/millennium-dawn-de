@@ -31,6 +31,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--retry-unchanged", action="store_true",
                    help="auch Texte erneut anfragen, die das Modell unveraendert zurueckgab (unchanged.jsonl)")
 
+    p = sub.add_parser("revalidate", help="Cache mit dem aktuellen Validator neu pruefen (Standard: Probelauf)")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", dest="apply", action="store_false",
+                      help="nur zaehlen und Beispiele zeigen (Standard)")
+    mode.add_argument("--apply", dest="apply", action="store_true",
+                      help="bereinigten Cache schreiben (vorher Backup translations.jsonl.bak-<zeit>)")
+    p.set_defaults(apply=False)
+    p.add_argument("--examples", type=int, default=3, metavar="N", help="Beispiele je Grund (Standard 3)")
+
     sub.add_parser("build", help="Ausgabedateien unter localisation/german erzeugen")
     sub.add_parser("check", help="Ausgabedateien pruefen (Exit 1 = Fehler, 2 = veraltet)")
 

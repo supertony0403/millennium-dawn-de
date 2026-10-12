@@ -9,8 +9,9 @@ from collections import Counter
 from . import build as buildmod
 from . import install as installmod
 from . import openrouter, scope
+from . import revalidate as revalidatemod
 from .build import md_version
-from .cache import RejectLog, TranslationCache, UnchangedLog
+from .cache import LockBusy, RejectLog, TranslationCache, UnchangedLog, run_lock
 from .config import Config
 from .translate import (
     RunOptions,
@@ -92,6 +93,16 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
 
 def cmd_translate(args: argparse.Namespace, cfg: Config) -> int:
     try:
+        with run_lock(cfg.lock_path):
+            return _translate(args, cfg)
+    except LockBusy:
+        print(f"Ein anderer Uebersetzungslauf laeuft bereits (Sperre {cfg.lock_path}) - abgebrochen.",
+              file=sys.stderr)
+        return 1
+
+
+def _translate(args: argparse.Namespace, cfg: Config) -> int:
+    try:
         glossary = load_glossary(cfg.glossary_path)
     except FileNotFoundError:
         print(f"Warnung: keine Begriffsliste unter {cfg.glossary_path}", file=sys.stderr)
@@ -129,6 +140,56 @@ def cmd_translate(args: argparse.Namespace, cfg: Config) -> int:
               file=sys.stderr)
         return EXIT_INTERRUPTED
     return 1 if report.stopped in FATAL_STOPS else 0
+
+
+def _short(text: str, width: int = 110) -> str:
+    return repr(text if len(text) <= width else text[: width - 1] + "…")
+
+
+def cmd_revalidate(args: argparse.Namespace, cfg: Config) -> int:
+    path = cfg.translations_path
+    if not path.exists():
+        print(f"Kein Cache unter {path}", file=sys.stderr)
+        return 1
+
+    def work() -> revalidatemod.RevalidateReport:
+        return revalidatemod.revalidate(
+            cfg.md_root, path, RejectLog(cfg.rejects_path), UnchangedLog(cfg.unchanged_path),
+            apply=args.apply, examples=args.examples,
+        )
+
+    if args.apply:
+        try:
+            with run_lock(cfg.lock_path):
+                report = work()
+        except LockBusy:
+            print(f"Ein Uebersetzungslauf haelt die Sperre {cfg.lock_path} - nichts geschrieben.",
+                  file=sys.stderr)
+            return 1
+    else:
+        report = work()
+    invalid = sum(n for r, n in report.by_reason.items() if r != "unchanged")
+    print(f"Revalidierung {path} (Millennium Dawn {md_version(cfg.md_root) or '?'}, "
+          + ("wird geschrieben" if args.apply else "Probelauf") + ")")
+    print(f"  geprueft:     {fmt(report.checked):>7} (neuester Eintrag je Schluessel und englischem Text)")
+    print(f"  gueltig:      {fmt(report.valid):>7}")
+    print(f"  ungueltig:    {fmt(invalid):>7} -> {cfg.rejects_path.name}")
+    print(f"  unveraendert: {fmt(report.by_reason.get('unchanged', 0)):>7} -> {cfg.unchanged_path.name}")
+    print(f"  englischer Text inzwischen geaendert (bleibt, wird nicht benutzt): {fmt(report.stale)}")
+    print(f"  ueberholte Duplikate: {fmt(report.superseded)}, kaputte Zeilen: {fmt(report.broken)}"
+          " (fallen mit --apply weg)")
+    if report.by_reason:
+        print("Gruende:")
+    for reason, count in report.by_reason.most_common():
+        share = count / report.checked if report.checked else 0
+        print(f"  {reason:<10} {fmt(count):>6} ({share:.1%})")
+        for key, en, de in report.examples.get(reason, []):
+            print(f"      {key}\n        EN {_short(en)}\n        DE {_short(de)}")
+    if args.apply:
+        print(f"Geschrieben. Backup: {report.backup}")
+    else:
+        print("Nur Probelauf - nichts geschrieben. Mit --apply schreiben (vorher Backup).")
+    return 0
 
 
 def cmd_build(args: argparse.Namespace, cfg: Config) -> int:
@@ -184,6 +245,7 @@ def cmd_install(args: argparse.Namespace, cfg: Config) -> int:
 HANDLERS = {
     "status": cmd_status,
     "translate": cmd_translate,
+    "revalidate": cmd_revalidate,
     "build": cmd_build,
     "check": cmd_check,
     "install": cmd_install,

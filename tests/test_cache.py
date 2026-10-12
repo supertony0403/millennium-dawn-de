@@ -5,7 +5,9 @@ import hashlib
 import json
 import threading
 
-from mdde.cache import RejectLog, TranslationCache
+import pytest
+
+from mdde.cache import LockBusy, RejectLog, TranslationCache, UnchangedLog, run_lock
 
 
 def sha1(text: str) -> str:
@@ -112,3 +114,38 @@ def test_reject_log_records_and_reloads(tmp_path):
     assert record["en"] == "Hello world"
     assert RejectLog(path).contains("k", "Hello world")
     assert not RejectLog(path).contains("k", "Hello world, changed")
+
+
+# -- review finding (small 1): a torn last line must not swallow the next record ------
+@pytest.mark.parametrize("make", [
+    lambda p: TranslationCache(p).put("good", "Reform the army", "Die Armee reformieren", "m"),
+    lambda p: RejectLog(p).add("good", "Reform the army", "tokens"),
+    lambda p: UnchangedLog(p).add("good", "Reform the army", "m"),
+])
+def test_append_after_torn_last_line_starts_a_new_line(tmp_path, make):
+    path = tmp_path / "log.jsonl"
+    path.write_text('{"key": "a", "src_sha1": "00", "de": "A"}\n{"key": "b", "src_sh', encoding="utf-8")
+    make(path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert json.loads(lines[-1])["key"] == "good"
+    assert lines[-2] == '{"key": "b", "src_sh'
+
+
+def test_torn_line_heals_for_the_cache_after_restart(tmp_path):
+    path = tmp_path / "t.jsonl"
+    path.write_text('{"key": "b", "src_sh', encoding="utf-8")
+    TranslationCache(path).put("good", "Reform the army", "Die Armee reformieren", "m")
+    reloaded = TranslationCache(path)
+    assert reloaded.get("good", "Reform the army") == "Die Armee reformieren"
+    assert reloaded.skipped == 1
+
+
+# -- review finding (small 7): only one translate run at a time ------------------------
+def test_run_lock_is_exclusive(tmp_path):
+    lock = tmp_path / "cache" / "translate.lock"
+    with run_lock(lock):
+        with pytest.raises(LockBusy):
+            with run_lock(lock):
+                pass
+    with run_lock(lock):  # released again
+        pass

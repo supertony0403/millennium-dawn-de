@@ -5,13 +5,21 @@ Each line is one JSON record ``{key, src_sha1, de, model, ts}``. A cached
 translation is only used while the SHA-1 of the *current* English text matches
 ``src_sha1``, so changed source texts are re-translated automatically. Later
 lines win over earlier ones; broken lines (e.g. from a killed process) are
-skipped. Writes are serialised with a lock and hit the disk immediately.
+skipped, and the next append starts on a fresh line so it is not swallowed by
+a torn one. Writes are serialised with a lock and hit the disk immediately.
+
+``run_lock`` is the inter-process lock (``cache/translate.lock``) that keeps
+two ``translate`` runs - or ``revalidate --apply`` and a run - apart.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -49,11 +57,15 @@ class _JsonlLog:
                     self.skipped += 1
 
     def _append(self, record: dict) -> None:
-        line = json.dumps(record, ensure_ascii=False) + "\n"
+        data = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.path, "a", encoding="utf-8") as fh:
-                fh.write(line)
+            with open(self.path, "ab+") as fh:
+                if fh.seek(0, os.SEEK_END):
+                    fh.seek(-1, os.SEEK_END)
+                    if fh.read(1) != b"\n":  # torn last line: do not glue onto it
+                        data = b"\n" + data
+                fh.write(data)  # "a" mode: always at the end
                 fh.flush()
 
 
@@ -134,3 +146,25 @@ class UnchangedLog(_JsonlLog):
         self._append({"key": key, "src_sha1": sha, "model": model, "ts": _now()})
         with self._lock:
             self._known.add((key, sha))
+
+
+
+class LockBusy(RuntimeError):
+    """Another process holds the run lock."""
+
+
+@contextmanager
+def run_lock(path: Path) -> Iterator[None]:
+    """Non-blocking exclusive ``flock`` on ``path`` for the duration of the block."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+", encoding="utf-8") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise LockBusy(f"{path} ist gesperrt - ein anderer Lauf ist aktiv") from None
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"{os.getpid()}\n")
+        fh.flush()
+        yield  # closing the file releases the lock

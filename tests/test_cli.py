@@ -9,7 +9,7 @@ from fakes import FakeTransport, completion
 
 from mdde import openrouter
 from mdde.__main__ import main
-from mdde.cache import TranslationCache, UnchangedLog
+from mdde.cache import TranslationCache, UnchangedLog, run_lock
 
 KEY = "sk-or-v1-cli-test-key"
 
@@ -156,3 +156,13 @@ def test_translate_with_broken_key_fails_without_echo(env, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "ungueltig" in captured.err
     assert "SECRET" not in captured.err + captured.out
+
+
+def test_second_translate_run_is_refused_while_one_is_running(env, monkeypatch, capsys):
+    monkeypatch.setenv("OPENROUTER_API_KEY", KEY)
+    transport = fake_translator()
+    monkeypatch.setattr(openrouter, "urllib_transport", quota_aware(transport))
+    with run_lock(env / "cache" / "translate.lock"):
+        assert main(["translate"]) == 1
+    assert transport.calls == []
+    assert "laeuft bereits" in capsys.readouterr().err

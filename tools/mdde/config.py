@@ -10,6 +10,8 @@ Millennium Dawn from the Steam workshop) and can be overridden per run:
     MDDE_MODELS     comma separated model chain
     MDDE_WORKERS    parallel requests (>=1)
     MDDE_RESERVE    free daily requests left untouched (>=0, for other apps)
+    MDDE_CACHE_DIR  cache folder (default: <MDDE_MOD_ROOT>/cache), e.g. a copy
+    MDDE_VANILLA_DE HOI4's own German localisation (read only)
 """
 from __future__ import annotations
 
@@ -24,6 +26,9 @@ DEFAULT_MD_ROOT = Path(
 )
 DEFAULT_HOI4_DIR = Path.home() / ".local/share/Paradox Interactive/Hearts of Iron IV"
 DEFAULT_KEY_FILE = Path.home() / "Documents/Programmierung/Backup/Discord-Bot/.env"
+DEFAULT_VANILLA_DE = Path(
+    "/mnt/steam-library/SteamLibrary/steamapps/common/Hearts of Iron IV/localisation/german"
+)
 DEFAULT_MODELS: tuple[str, ...] = (
     "nvidia/nemotron-3-super-120b-a12b:free",
     "google/gemma-4-31b-it:free",
@@ -45,10 +50,16 @@ class Config:
     models: tuple[str, ...]
     workers: int
     reserve: int
+    cache_dir_override: Path | None = None
+    vanilla_de_dir: Path = DEFAULT_VANILLA_DE
 
     @property
     def cache_dir(self) -> Path:
-        return self.mod_root / "cache"
+        return self.cache_dir_override or self.mod_root / "cache"
+
+    @property
+    def lock_path(self) -> Path:
+        return self.cache_dir / "translate.lock"
 
     @property
     def translations_path(self) -> Path:
@@ -79,7 +90,7 @@ class Config:
         return self.mod_root / "tools" / "glossary.json"
 
 
-def _path(env: Mapping[str, str], name: str, default: Path) -> Path:
+def _path(env: Mapping[str, str], name: str, default: Path | None) -> Path | None:
     raw = env.get(name, "").strip()
     return Path(raw).expanduser() if raw else default
 
@@ -118,4 +129,6 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         models=_models(env),
         workers=_int(env, "MDDE_WORKERS", DEFAULT_WORKERS, 1),
         reserve=_int(env, "MDDE_RESERVE", DEFAULT_RESERVE, 0),
+        cache_dir_override=_path(env, "MDDE_CACHE_DIR", None),
+        vanilla_de_dir=_path(env, "MDDE_VANILLA_DE", DEFAULT_VANILLA_DE),
     )

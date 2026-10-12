@@ -89,3 +89,11 @@ def test_cli_without_command_fails_with_usage():
     )
     assert proc.returncode == 2
     assert "usage" in (proc.stdout + proc.stderr).lower()
+
+
+def test_cache_dir_can_point_to_a_copy(tmp_path):
+    cfg = load_config({"MDDE_CACHE_DIR": str(tmp_path / "copy")})
+    assert cfg.translations_path == tmp_path / "copy" / "translations.jsonl"
+    assert cfg.rejects_path == tmp_path / "copy" / "rejects.jsonl"
+    assert cfg.unchanged_path == tmp_path / "copy" / "unchanged.jsonl"
+    assert cfg.lock_path == tmp_path / "copy" / "translate.lock"
