@@ -10,3 +10,5 @@ build/
 localisation/
 build_info.json
 logs/
+cache/*.bak-*
+cache/translate.lock
