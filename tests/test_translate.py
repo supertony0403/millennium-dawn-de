@@ -402,6 +402,26 @@ def test_three_length_violations_discard_the_whole_package(tmp_path):
     assert env.cache.get("k3", texts[3]) == good[texts[3]]
 
 
+# -- review 2, W-2: unchanged answers are no neighbour hits ------------------------------
+TREATY = ["Abu Dhabi National Oil Company Exploration Division",
+          "Kuwait Petroleum Corporation International Holdings",
+          "Saudi Arabian Mining Company Phosphate Operations"]
+
+
+def test_unchanged_answers_do_not_count_as_neighbour_hits():
+    assert not Runner._suspect(TREATY, list(TREATY))
+
+
+def test_package_with_several_unchanged_answers_is_kept_in_one_request(tmp_path):
+    units = [(f"t{i}", en) for i, en in enumerate(TREATY)] + [("a", "German Unity")]
+    env = Env(tmp_path, responder=translator({**{en: en for en in TREATY}, **TABLE}))
+    report = env.runner.run(units)
+    assert len(env.chat_calls) == 1
+    assert report.shifted_packages == 0
+    assert report.unchanged == 3
+    assert env.cache.get("a", "German Unity") == "Deutsche Einheit"
+
+
 # -- review finding K1: the reserve is never undercut ---------------------------------
 class LiveQuota:
     """Transport whose daily quota really drops by one per chat request.

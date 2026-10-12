@@ -374,8 +374,8 @@ class Runner:
             return True
         neighbour_fits = 0
         for i, (en, de) in enumerate(zip(texts, answers)):
-            if not isinstance(de, str) or validate.check(en, de) is None:
-                continue
+            if not isinstance(de, str) or validate.check(en, de) in (None, "unchanged"):
+                continue  # fits its own text (an unchanged answer is no neighbour's)
             for j in (i - 1, i + 1):
                 other = texts[j] if 0 <= j < len(texts) else None
                 if (other is not None and other != en and validate.distinctive(other)
