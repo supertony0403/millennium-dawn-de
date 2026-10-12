@@ -75,8 +75,9 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
         try:
             client = _client(cfg)
             quota = client.quota()
-        except openrouter.KeyNotFound:
-            print("Tageskontingent:         unbekannt (kein OPENROUTER_API_KEY)")
+        except openrouter.KeyNotFound as exc:
+            print("Tageskontingent:         unbekannt ("
+                  + (str(exc) if isinstance(exc, openrouter.InvalidKey) else "kein OPENROUTER_API_KEY") + ")")
         else:
             if quota is None:
                 print("Tageskontingent:         unbekannt (Antwort ohne free_model_daily_requests; "
@@ -97,6 +98,9 @@ def cmd_translate(args: argparse.Namespace, cfg: Config) -> int:
         glossary = {}
     try:
         client = _client(cfg, build_system_prompt(glossary))
+    except openrouter.InvalidKey as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     except openrouter.KeyNotFound:
         _missing_key(cfg)
         return 1

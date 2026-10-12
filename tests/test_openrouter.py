@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import traceback
 
 import pytest
 from fakes import FakeSleep, FakeTransport, completion, error
@@ -9,6 +10,7 @@ from fakes import FakeSleep, FakeTransport, completion, error
 from mdde.openrouter import (
     AuthError,
     Client,
+    InvalidKey,
     KeyNotFound,
     NoModelAvailable,
     QuotaExhausted,
@@ -89,11 +91,11 @@ def test_wait_grows_and_is_capped_at_five_minutes():
     assert sleep.calls == [60, 120, 180, 240, 300, 300]
 
 
-def test_waiting_gives_up_after_max_waits():
+def test_only_permanently_rate_limited_models_left_raises():
     sleep = FakeSleep()
     transport = FakeTransport([error(429)] * 6)
-    result = make_client(transport, sleep, max_waits=2).translate_batch(BATCH)
-    assert not result.ok
+    with pytest.raises(NoModelAvailable):
+        make_client(transport, sleep, max_waits=2).translate_batch(BATCH)
     assert sleep.calls == [60, 120]
     assert len(transport.calls) == 6
 
@@ -265,3 +267,66 @@ def test_unknown_quota_structure_exposes_field_names_only():
     client = make_client(FakeTransport([(200, json.dumps(payload).encode())]))
     assert client.quota() is None
     assert client.quota_fields == ["label", "limits", "usage"]
+
+
+# -- review finding W1: content moderation is a batch error, not a model error --------
+def moderation(flagged="suicide bombers"):
+    body = {"error": {"code": 403, "message": "Your chosen model requires moderation and your input was flagged",
+                      "metadata": {"reasons": ["violence"], "flagged_input": flagged,
+                                   "provider_name": "X", "model_slug": "m1"}}}
+    return 403, json.dumps(body).encode()
+
+
+def test_moderation_403_fails_the_batch_but_keeps_the_model():
+    transport = FakeTransport([moderation(), completion(GOOD)])
+    client = make_client(transport)
+    first = client.translate_batch(BATCH)
+    assert not first.ok and first.moderated and first.model == M1
+    assert client.disabled == set()
+    second = client.translate_batch(BATCH)
+    assert second.ok and second.model == M1
+    assert [c.model for c in transport.calls] == [M1, M1]
+
+
+@pytest.mark.parametrize("metadata", [{"reasons": ["hate"]}, {"flagged_input": "x"}])
+def test_moderation_is_recognised_by_either_field(metadata):
+    body = json.dumps({"error": {"code": 403, "message": "flagged", "metadata": metadata}}).encode()
+    result = make_client(FakeTransport([(403, body)])).translate_batch(BATCH)
+    assert result.moderated
+
+
+# -- review finding K6: one level of nesting in the answer ------------------------------
+@pytest.mark.parametrize(
+    "content",
+    ['{"translations": {"0": "a", "1": "b"}}', '{"result": {"0": "a", "1": "b"}, "note": "ok"}'],
+)
+def test_extract_json_object_unwraps_one_level(content):
+    assert extract_json_object(content, {"0", "1"}) == {"0": "a", "1": "b"}
+
+
+def test_nested_answer_is_used_by_the_client():
+    client = make_client(FakeTransport([completion({"translations": GOOD})]))
+    assert client.translate_batch(BATCH).texts == GOOD
+
+
+# -- review finding K2 (small): invalid key characters never leak ----------------------
+SECRET = "sk-or-v1-SECRETSECRET"
+
+
+@pytest.mark.parametrize("raw", [f"{SECRET}\nOTHER=1\n", f"{SECRET} trailing", f"{SECRET}$x"])
+def test_key_with_invalid_characters_is_refused_without_echo(tmp_path, raw):
+    with pytest.raises(InvalidKey) as excinfo:
+        load_api_key({"OPENROUTER_API_KEY": raw}, tmp_path / "none.env")
+    assert "SECRET" not in str(excinfo.value)
+
+
+def test_header_error_from_transport_is_masked():
+    def transport(method, url, headers, body, timeout):
+        raise ValueError(f"Invalid header value b'Bearer {KEY}\\nX'")
+
+    client = make_client(transport)
+    with pytest.raises(AuthError) as excinfo:
+        client.translate_batch(BATCH)
+    text = "".join(traceback.format_exception(excinfo.value))
+    assert KEY not in text
+    assert all(KEY not in e for e in client.errors)

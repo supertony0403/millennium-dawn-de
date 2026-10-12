@@ -3,14 +3,21 @@
 Error handling (spec "Fehlerbehandlung"):
 
 * 429 -> try the next model immediately; if every model answered 429, wait
-  (60 s, growing by 60 s up to 5 min) and run the chain again.
+  (60 s, growing by 60 s up to 5 min) and run the chain again; after
+  ``max_waits`` such waits only permanently limited models are left
+  -> ``NoModelAvailable``.
 * 429 "free-models-per-day" -> ``QuotaExhausted`` (daily account limit).
-* 403/404 -> drop the model for the rest of the run.
+* 403 with moderation metadata (``error.metadata.reasons`` /
+  ``flagged_input``) -> the *input* was flagged: the batch fails with
+  ``BatchResult.moderated`` and the model stays in the chain.
+* other 403/404 -> drop the model for the rest of the run.
 * 401/402 -> ``AuthError`` (nothing to retry).
 * timeout, network error, 5xx, other HTTP codes, unusable body -> next model;
   at most ``max_rounds`` passes over the chain per batch.
 
-The API key is never written to logs, exceptions or ``repr``.
+The API key is never written to logs, exceptions or ``repr``; keys with
+characters other than letters, digits, ``_`` and ``-`` are refused when they
+are loaded.
 """
 from __future__ import annotations
 
@@ -34,11 +41,16 @@ Transport = Callable[[str, str, Mapping[str, str], "bytes | None", float], "tupl
 
 _KEY_FILE_RE = re.compile(r"OPENROUTER(?:_API)?_KEY\s*=\s*[\"']?([^\s\"']+)")
 _DAILY_LIMIT_MARKER = "free-models-per-day"
-_RATE_LIMITED, _GONE, _TRANSIENT = "rate_limited", "gone", "transient"
+_RATE_LIMITED, _GONE, _TRANSIENT, _MODERATED = "rate_limited", "gone", "transient", "moderated"
+_VALID_KEY_RE = re.compile(r"[\w-]+")
 
 
 class KeyNotFound(RuntimeError):
     pass
+
+
+class InvalidKey(KeyNotFound):
+    """The key contains characters that cannot be sent (line break, space ...)."""
 
 
 class AuthError(RuntimeError):
@@ -54,18 +66,38 @@ class NoModelAvailable(RuntimeError):
 
 
 def load_api_key(env: Mapping[str, str], key_file: Path) -> str:
-    """``OPENROUTER_API_KEY`` from ``env``, else from ``key_file`` (dotenv style)."""
+    """``OPENROUTER_API_KEY`` from ``env``, else from ``key_file`` (dotenv style).
+
+    Raises ``InvalidKey`` (without the key in the message) if the key contains
+    anything but letters, digits, ``_`` and ``-`` - e.g. a line break would
+    otherwise end up in an ``Invalid header value`` traceback.
+    """
     key = env.get("OPENROUTER_API_KEY", "").strip()
-    if key:
-        return key
+    source = "OPENROUTER_API_KEY"
+    if not key:
+        try:
+            text = Path(key_file).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise KeyNotFound(f"Schluesseldatei nicht lesbar: {key_file}") from exc
+        m = _KEY_FILE_RE.search(text)
+        if not m:
+            raise KeyNotFound(f"kein OPENROUTER_API_KEY in {key_file}")
+        key, source = m.group(1), str(key_file)
+    if not _VALID_KEY_RE.fullmatch(key):
+        raise InvalidKey(f"API-Schluessel aus {source} ist ungueltig (erlaubt: Buchstaben, Ziffern, _ "
+                         f"und -; Zeilenumbruch oder Leerzeichen im Wert?)")
+    return key
+
+
+def _is_moderation(text: str) -> bool:
+    """403 body with ``error.metadata.reasons`` or ``flagged_input`` (input flagged)."""
     try:
-        text = Path(key_file).read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        raise KeyNotFound(f"Schluesseldatei nicht lesbar: {key_file}") from exc
-    m = _KEY_FILE_RE.search(text)
-    if not m:
-        raise KeyNotFound(f"kein OPENROUTER_API_KEY in {key_file}")
-    return m.group(1)
+        data = json.loads(text)
+    except ValueError:
+        return False
+    error = data.get("error") if isinstance(data, dict) else None
+    meta = error.get("metadata") if isinstance(error, dict) else None
+    return isinstance(meta, dict) and bool(meta.get("reasons") or "flagged_input" in meta)
 
 
 def urllib_transport(method: str, url: str, headers: Mapping[str, str], body: bytes | None,
@@ -99,8 +131,12 @@ def extract_json_object(content: str, expected_keys: Iterable[str]) -> dict | No
         except json.JSONDecodeError:
             pos = content.find("{", pos + 1)
             continue
-        if isinstance(obj, dict) and wanted & obj.keys():
-            return obj
+        if isinstance(obj, dict):
+            if wanted & obj.keys():
+                return obj
+            for inner in obj.values():  # {"translations": {"0": ...}}
+                if isinstance(inner, dict) and wanted & inner.keys():
+                    return inner
         pos = content.find("{", end if end > pos else pos + 1)
     return None
 
@@ -110,6 +146,7 @@ class BatchResult:
     texts: dict[str, object] = field(default_factory=dict)
     model: str | None = None
     ok: bool = False
+    moderated: bool = False  # the input was flagged (403 with moderation metadata)
 
 
 class Client:
@@ -179,6 +216,7 @@ class Client:
             "response_format": {"type": "json_object"},
             "reasoning": {"effort": "low", "exclude": True},
         }
+        unsendable = False
         try:
             status, raw = self.transport("POST", CHAT_URL, self._headers(),
                                          json.dumps(body).encode("utf-8"), self.timeout)
@@ -190,6 +228,12 @@ class Client:
             self._count("network_errors")
             self._note(model, f"Netzwerkfehler {type(exc).__name__}")
             return _TRANSIENT
+        except ValueError:  # e.g. "Invalid header value b'Bearer <key>...'" - never echo it
+            unsendable = True
+        if unsendable:  # raised outside the except block: no chained exception with the key
+            self._count("unsendable")
+            self._note(model, "Anfrage nicht sendbar (ungueltiger Header-Wert)")
+            raise AuthError("Anfrage nicht sendbar: ungueltiger Header-Wert - API-Schluessel pruefen")
 
         text = raw.decode("utf-8", errors="replace")
         if status != 200:
@@ -201,6 +245,9 @@ class Client:
                 return _RATE_LIMITED
             if status in (401, 402):
                 raise AuthError(f"OpenRouter lehnt die Anfrage ab (HTTP {status})")
+            if status == 403 and _is_moderation(text):
+                self._count("moderated")
+                return _MODERATED
             if status in (403, 404):
                 with self._lock:
                     self.disabled.add(model)
@@ -239,6 +286,8 @@ class Client:
                 outcome = self._attempt(model, batch)
                 if isinstance(outcome, BatchResult):
                     return outcome
+                if outcome == _MODERATED:
+                    return BatchResult(model=model, moderated=True)
                 transient |= outcome == _TRANSIENT
                 rate_limited |= outcome == _RATE_LIMITED
             if transient:
@@ -247,7 +296,10 @@ class Client:
                     return BatchResult()
             elif rate_limited:
                 if waits >= self.max_waits:
-                    return BatchResult()
+                    raise NoModelAvailable(
+                        f"nur noch dauerhaft rate-limitierte Modelle ({', '.join(chain)}) - "
+                        f"nach {waits} Wartepausen aufgegeben"
+                    )
                 self._count("waits")
                 self.sleep(self.wait_schedule[min(waits, len(self.wait_schedule) - 1)])
                 waits += 1

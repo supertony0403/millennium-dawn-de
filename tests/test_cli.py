@@ -148,3 +148,11 @@ def test_translate_ctrl_c_exits_130(env, monkeypatch, capsys):
     monkeypatch.setattr("mdde.cli.Runner.run", interrupted)
     assert main(["translate"]) == 130
     assert "Abgebrochen" in capsys.readouterr().err
+
+
+def test_translate_with_broken_key_fails_without_echo(env, monkeypatch, capsys):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-SECRETSECRET\nOTHER=1")
+    assert main(["translate"]) == 1
+    captured = capsys.readouterr()
+    assert "ungueltig" in captured.err
+    assert "SECRET" not in captured.err + captured.out

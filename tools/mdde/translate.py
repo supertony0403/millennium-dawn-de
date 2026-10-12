@@ -11,7 +11,11 @@ Flow per run:
 3. a package whose answers look shifted (>= 3 length-ratio violations, or
    >= 2 answers that fit a neighbouring text but not their own) is discarded
    as a whole: big packages go to round two, small ones are split in halves;
-4. round two: invalid or failed texts again in packages of 10; texts that are
+4. a package that the provider's content moderation refuses (HTTP 403 with
+   moderation metadata) is split in halves until the flagged text is alone;
+   that text goes straight to the reject log (reason ``moderation``), the
+   model stays in the chain;
+   round two: invalid or failed texts again in packages of 10; texts that are
    still invalid go to the reject log (the English text stays in the game);
 5. a budget (``Budget``) guards every request: ``--max-requests`` and the
    free daily quota. The quota is queried at the start and every 50 requests
@@ -55,6 +59,7 @@ Regeln:
 MAX_RESET_WAITS = 3
 SUSPECT_LENGTH_VIOLATIONS = 3  # length-ratio violations that discard a package
 SUSPECT_NEIGHBOUR_FITS = 2  # answers that fit a neighbour instead of their own text
+FINAL_REASONS = ("moderation",)  # rejected at once, a second round would not help
 
 
 def load_glossary(path: Path) -> dict[str, str]:
@@ -354,6 +359,12 @@ class Runner:
         result = self._request(texts)
         if result is None:
             return {en: ("skipped", None, None) for en in texts}
+        if result.moderated:
+            if len(texts) == 1:
+                self.log(f"Moderation ({result.model}) sperrt einen Text - kommt in die Ablehnungen")
+                return {texts[0]: ("moderation", result.model, None)}
+            self.log(f"Moderation ({result.model}) sperrt ein Paket mit {len(texts)} Texten - teile auf")
+            return self._split(texts, keys)
         if not result.ok:
             return {en: ("batch", None, None) for en in texts}
         answers = [result.texts.get(str(i)) for i in range(len(texts))]
@@ -459,16 +470,18 @@ class Runner:
         if self.budget.stopped:
             return
         first = self._round(1, list(keys), keys, self.opts.batch_items)
-        retry = [en for en, f in first.items() if f[0] != "skipped"]
+        self._reject({en: f for en, f in first.items() if f[0] in FINAL_REASONS}, keys)
+        retry = [en for en, f in first.items() if f[0] not in ("skipped", *FINAL_REASONS)]
         if not retry or self.budget.stopped:
             return
         second = self._round(2, retry, keys, self.opts.retry_items)
-        for en, (reason, model, de) in second.items():
-            if reason in ("batch", "skipped"):
-                continue
+        self._reject({en: f for en, f in second.items() if f[0] not in ("batch", "skipped")}, keys)
+
+    def _reject(self, failures: Mapping[str, tuple], keys: Mapping[str, list[str]]) -> None:
+        for en, (reason, model, de) in failures.items():
             for key in keys[en]:
                 self.rejects.add(key, en, reason, model=model, de=de)
-            rep.rejected += len(keys[en])
+            self.report.rejected += len(keys[en])
 
     def _write_summary(self, started: datetime) -> None:
         summary = asdict(self.report)

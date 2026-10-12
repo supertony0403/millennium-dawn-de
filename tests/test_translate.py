@@ -559,3 +559,34 @@ def test_progress_line_shows_clock_and_remaining_time(tmp_path):
 
 def test_default_run_options_use_six_workers():
     assert RunOptions().workers == 6
+
+
+# -- review finding W1 in the runner --------------------------------------------------
+def test_moderated_text_is_isolated_and_rejected_without_blocking_the_model(tmp_path):
+    flagged = "Twelve suicide bombers set off explosions in Casablanca"
+
+    def responder(payload):
+        batch = json.loads(payload["messages"][1]["content"])
+        if flagged in batch.values():
+            return 403, json.dumps({"error": {"code": 403, "message": "flagged",
+                                              "metadata": {"reasons": ["violence"]}}}).encode()
+        return completion({i: f"Satz {en}" for i, en in batch.items()})
+
+    env = Env(tmp_path, responder=responder, batch_items=10)
+    units = [("morocco.400.d", flagged)] + [(f"k{i}", f"Harmless english sentence number {i}") for i in range(9)]
+    report = env.runner.run(units)
+    assert report.translated == 9
+    assert report.rejected == 1
+    assert env.client.disabled == set()
+    record = json.loads((tmp_path / "cache" / "rejects.jsonl").read_text().splitlines()[0])
+    assert (record["key"], record["reason"]) == ("morocco.400.d", "moderation")
+    assert sum(1 for c in env.chat_calls if flagged in c.body["messages"][1]["content"]) == 4  # 10, 5, 3, 1 - no round two
+    assert report.stopped is None
+
+
+def test_only_rate_limited_models_left_stops_the_run(tmp_path):
+    env = Env(tmp_path, responder=lambda p: error(429, "rate-limited upstream"), batch_items=1)
+    env.client.max_waits = 2
+    report = env.runner.run([("a", "German Unity"), ("b", "Reform the army")])
+    assert report.stopped == "no-models"
+    assert len(env.chat_calls) == 3
