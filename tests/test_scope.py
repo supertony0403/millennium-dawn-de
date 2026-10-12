@@ -92,3 +92,52 @@ def test_unknown_scope_is_rejected(md_root):
 )
 def test_is_open(en, de, expected):
     assert scope.is_open(en, de) is expected
+
+
+# -- review finding W3: stale English copies in Millennium Dawn's German files --------
+@pytest.mark.parametrize(
+    "en,de",
+    [
+        # >= 3 English and <= 1 German stop words
+        (
+            "We have attracted lots of investors thanks to our deregulation policies",
+            "We have attracted many investors thanks to our deregulation policies",
+        ),
+        (
+            "The collapse of the USSR brought our country into a new geopolitical environment",
+            "The collapse of the USSR brought Kazakhstan into a new geopolitical environment",
+        ),
+        # lower-case word overlap > 60 % with the English text
+        (
+            "§gwill launch an uprising in favor of a§! §Ymonarchy§!",
+            "§gwill launch an uprising in favour of a§! §Ymonarch§!",
+        ),
+        # equal up to case and whitespace
+        ("Reform the army", "Reform the Army "),
+    ],
+)
+def test_stale_english_german_value_is_open(en, de):
+    assert scope.is_open(en, de) is True
+
+
+@pytest.mark.parametrize(
+    "en,de",
+    [
+        ("Petr Pavel Completed Mission in Afghanistan", "Petr Pavel hat die Mission in Afghanistan abgeschlossen"),
+        ("Osama bin Laden Killed", "Osama bin Laden getötet"),
+        ("Execute Operation Enduring Freedom (OEF)", "Durchführung der Operation Enduring Freedom (OEF)"),
+        ("Large-Scale TEG Integration", "Großangelegte TEG-Integration"),
+        (
+            "Mu isamaa, mu õnn ja rõõm (My Fatherland, my Happiness and Joy)!",
+            "Mu isamaa, mu õnn ja rõõm (Mein Vaterland, mein Glück und meine Freude)!",
+        ),
+        (
+            "£tank_design_cost_texticon modular_light_sp_anti_air_brigade Unit Cost",
+            "£tank_design_cost_texticon modular_light_sp_anti_air_brigade Einheitskosten",
+        ),
+        ("View the latest changes in Millennium Dawn: A Modern Day Mod",
+         "Siehe die neuesten Änderungen in Millennium Dawn: A Modern Day Mod."),
+    ],
+)
+def test_real_german_translation_is_not_open(en, de):
+    assert scope.is_open(en, de) is False

@@ -59,6 +59,10 @@ class Config:
         return self.cache_dir / "rejects.jsonl"
 
     @property
+    def unchanged_path(self) -> Path:
+        return self.cache_dir / "unchanged.jsonl"
+
+    @property
     def log_dir(self) -> Path:
         return self.mod_root / "logs"
 

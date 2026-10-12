@@ -1,7 +1,9 @@
 """Find the English texts that are still "open" (untranslated) per scope.
 
-A text is open when its German value in Millennium Dawn is missing or equal to
-the English one and the English text contains real words (see ``is_open``).
+A text is open when the English text contains real words and its German value
+in Millennium Dawn is missing, equal to the English one (ignoring case and
+whitespace) or an old English copy that no longer matches the current English
+text exactly (see ``validate.stale_english``).
 
 Scopes:
     germany  everything except foreign focus trees (``MD_focus_<TAG>``), pure
@@ -18,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import locfile
-from .validate import has_text
+from . import validate
 
 SCOPES = ("germany", "full")
 OWN_TAG = "GER"
@@ -104,7 +106,11 @@ def discover(md_root: Path) -> list[LocPair]:
 
 
 def is_open(en: str, de_current: str | None) -> bool:
-    return (de_current is None or de_current == en) and has_text(en)
+    if not validate.has_text(en):
+        return False
+    if de_current is None or validate.normalized(de_current) == validate.normalized(en):
+        return True
+    return validate.stale_english(en, de_current)
 
 
 def file_in_scope(base: str, scope: str, tags: Iterable[str]) -> bool:

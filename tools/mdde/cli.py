@@ -10,7 +10,7 @@ from . import build as buildmod
 from . import install as installmod
 from . import openrouter, scope
 from .build import md_version
-from .cache import RejectLog, TranslationCache
+from .cache import RejectLog, TranslationCache, UnchangedLog
 from .config import Config
 from .translate import RunOptions, Runner, build_system_prompt, load_glossary, make_batches
 
@@ -36,9 +36,17 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
     items = scope.collect(cfg.md_root, args.scope)
     cache = TranslationCache(cfg.translations_path)
     rejects = RejectLog(cfg.rejects_path)
-    cached = [i for i in items if cache.get(i.key, i.en) is not None]
-    rejected = [i for i in items if cache.get(i.key, i.en) is None and rejects.contains(i.key, i.en)]
-    todo = [i for i in items if cache.get(i.key, i.en) is None and not rejects.contains(i.key, i.en)]
+    unchanged = UnchangedLog(cfg.unchanged_path)
+    cached, rejected, kept, todo = [], [], [], []
+    for i in items:
+        if cache.get(i.key, i.en) is not None:
+            cached.append(i)
+        elif rejects.contains(i.key, i.en):
+            rejected.append(i)
+        elif unchanged.contains(i.key, i.en):
+            kept.append(i)
+        else:
+            todo.append(i)
     distinct = list(dict.fromkeys(i.en for i in todo))
     batches = make_batches([(en, en) for en in distinct], 9000, 100)
 
@@ -46,6 +54,7 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
     print(f"Offene Texte:            {fmt(len(items)):>9} ({fmt(sum(len(i.en) for i in items))} Zeichen)")
     print(f"  davon im Cache:        {fmt(len(cached)):>9}")
     print(f"  davon abgelehnt:       {fmt(len(rejected)):>9}")
+    print(f"  davon unveraendert:    {fmt(len(kept)):>9} (Modell gab Englisch zurueck, --retry-unchanged)")
     print(f"  noch zu uebersetzen:   {fmt(len(todo)):>9} ({fmt(len(distinct))} verschiedene Texte, "
           f"{fmt(sum(len(t) for t in distinct))} Zeichen)")
     print(f"Geschaetzte Anfragen:    {fmt(len(batches)):>9} (Pakete <= 9000 Zeichen / <= 100 Texte)")
@@ -94,8 +103,10 @@ def cmd_translate(args: argparse.Namespace, cfg: Config) -> int:
             max_requests=args.max_requests,
             wait_for_reset=args.wait_for_reset,
             retry_rejects=args.retry_rejects,
+            retry_unchanged=args.retry_unchanged,
         ),
         log_dir=cfg.log_dir,
+        unchanged=UnchangedLog(cfg.unchanged_path),
     )
     report = runner.run((i.key, i.en) for i in items)
     return 1 if report.stopped in FATAL_STOPS else 0

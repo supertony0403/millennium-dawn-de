@@ -1,4 +1,5 @@
-"""Append-only translation cache (``cache/translations.jsonl``) and reject log.
+"""Append-only translation cache (``cache/translations.jsonl``), reject log and
+the log of texts the model returned unchanged (``cache/unchanged.jsonl``).
 
 Each line is one JSON record ``{key, src_sha1, de, model, ts}``. A cached
 translation is only used while the SHA-1 of the *current* English text matches
@@ -103,5 +104,33 @@ class RejectLog(_JsonlLog):
             {"key": key, "src_sha1": sha, "en": en, "reason": reason, "model": model,
              "de": de if isinstance(de, str) else None, "ts": _now()}
         )
+        with self._lock:
+            self._known.add((key, sha))
+
+
+class UnchangedLog(_JsonlLog):
+    """Texts the model returned unchanged (``{key, src_sha1, model, ts}``).
+
+    They are kept out of the translation cache, so the English text stays in
+    the game, and are not requested again unless ``--retry-unchanged`` is used.
+    """
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self._known: set[tuple[str, str]] = set()
+        for record in self._records():
+            key, sha = record.get("key"), record.get("src_sha1")
+            if isinstance(key, str) and isinstance(sha, str):
+                self._known.add((key, sha))
+
+    def __len__(self) -> int:
+        return len(self._known)
+
+    def contains(self, key: str, en: str) -> bool:
+        return (key, src_hash(en)) in self._known
+
+    def add(self, key: str, en: str, model: str | None = None) -> None:
+        sha = src_hash(en)
+        self._append({"key": key, "src_sha1": sha, "model": model, "ts": _now()})
         with self._lock:
             self._known.add((key, sha))

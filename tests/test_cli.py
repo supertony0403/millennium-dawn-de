@@ -9,7 +9,7 @@ from fakes import FakeTransport, completion
 
 from mdde import openrouter
 from mdde.__main__ import main
-from mdde.cache import TranslationCache
+from mdde.cache import TranslationCache, UnchangedLog
 
 KEY = "sk-or-v1-cli-test-key"
 
@@ -98,3 +98,26 @@ def test_status_shows_quota_when_key_available(env, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert number_after("Tageskontingent", out) == 742
     assert KEY not in out
+
+
+def test_status_counts_unchanged_texts_separately(env, capsys):
+    UnchangedLog(env / "cache" / "unchanged.jsonl").add("GER_focus_unity", "German Unity", "m")
+    assert main(["status", "--no-quota"]) == 0
+    out = capsys.readouterr().out
+    assert number_after("unveraendert", out) == 1
+    assert number_after("noch zu", out) == 11
+
+
+def test_translate_skips_unchanged_unless_retry_unchanged(env, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", KEY)
+    UnchangedLog(env / "cache" / "unchanged.jsonl").add("GER_focus_unity", "German Unity", "m")
+    transport = fake_translator()
+    monkeypatch.setattr(openrouter, "urllib_transport", quota_aware(transport))
+    assert main(["translate"]) == 0
+    sent = [en for c in transport.calls for en in json.loads(c.body["messages"][1]["content"]).values()]
+    assert "German Unity" not in sent
+    transport2 = fake_translator()
+    monkeypatch.setattr(openrouter, "urllib_transport", quota_aware(transport2))
+    assert main(["translate", "--retry-unchanged"]) == 0
+    sent = [en for c in transport2.calls for en in json.loads(c.body["messages"][1]["content"]).values()]
+    assert sent == ["German Unity"]

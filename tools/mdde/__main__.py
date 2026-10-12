@@ -26,6 +26,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="bei erschoepftem Kontingent bis 00:00 UTC schlafen und weitermachen")
     p.add_argument("--retry-rejects", action="store_true",
                    help="auch Texte erneut versuchen, die schon in rejects.jsonl stehen")
+    p.add_argument("--retry-unchanged", action="store_true",
+                   help="auch Texte erneut anfragen, die das Modell unveraendert zurueckgab (unchanged.jsonl)")
 
     sub.add_parser("build", help="Ausgabedateien unter localisation/german erzeugen")
     sub.add_parser("check", help="Ausgabedateien pruefen (Exit 1 = Fehler, 2 = veraltet)")

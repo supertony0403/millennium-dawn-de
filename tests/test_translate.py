@@ -1,6 +1,7 @@
 """Translation runner: batching, cache use, budget, second round (offline)."""
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import Counter
 from datetime import datetime, timezone
@@ -302,3 +303,88 @@ def test_invalid_glossary_is_rejected(tmp_path, bad):
     path.write_text(bad)
     with pytest.raises(ValueError):
         load_glossary(path)
+
+
+# -- review finding W2: unchanged answers and shifted packages ------------------------
+def test_unchanged_answer_goes_to_unchanged_log_not_cache(tmp_path):
+    env = Env(tmp_path, responder=translator({"Saudi Aramco": "Saudi Aramco"}))
+    report = env.runner.run([("k1", "Saudi Aramco"), ("k2", "German Unity")])
+    assert env.cache.get("k1", "Saudi Aramco") is None
+    assert env.cache.get("k2", "German Unity") == "Übersetzt"
+    assert report.unchanged == 1
+    assert report.translated == 1
+    assert report.rejected == 0
+    assert env.sent_texts() == ["Saudi Aramco", "German Unity"]  # no second round
+    record = json.loads((tmp_path / "cache" / "unchanged.jsonl").read_text().splitlines()[0])
+    assert (record["key"], record["model"]) == ("k1", "m1")
+    assert record["src_sha1"] == hashlib.sha1("Saudi Aramco".encode()).hexdigest()
+
+
+def test_unchanged_texts_are_skipped_next_time_unless_requested(tmp_path):
+    first = Env(tmp_path, responder=translator({"Saudi Aramco": "Saudi Aramco"}))
+    first.runner.run([("k1", "Saudi Aramco")])
+    again = Env(tmp_path)
+    report = again.runner.run([("k1", "Saudi Aramco")])
+    assert again.chat_calls == []
+    assert report.skipped_unchanged == 1
+    retry = Env(tmp_path, retry_unchanged=True)
+    retry.runner.run([("k1", "Saudi Aramco")])
+    assert retry.sent_texts() == ["Saudi Aramco"]
+
+
+SHIFT_TEXTS = [
+    "§YGerman Unity§! is the declared goal of our government",
+    "Reform the army and raise $COUNT$ new divisions for the defence of the nation",
+    "Build more factories in [ROOT.GetName] to strengthen the economy",
+    "Short text one",
+    "Another short text",
+]
+SHIFT_TABLE = {
+    SHIFT_TEXTS[0]: "§YDeutsche Einheit§! ist das erklärte Ziel unserer Regierung",
+    SHIFT_TEXTS[1]: "Die Armee reformieren und $COUNT$ neue Divisionen zur Verteidigung der Nation aufstellen",
+    SHIFT_TEXTS[2]: "Mehr Fabriken in [ROOT.GetName] bauen, um die Wirtschaft zu stärken",
+    SHIFT_TEXTS[3]: "Kurzer Text eins",
+    SHIFT_TEXTS[4]: "Noch ein kurzer Text",
+}
+
+
+def test_shifted_answers_discard_the_whole_package(tmp_path):
+    calls = Counter()
+
+    def responder(payload):
+        batch = json.loads(payload["messages"][1]["content"])
+        calls["n"] += 1
+        texts = [batch[str(i)] for i in range(len(batch))]
+        if calls["n"] == 1:  # answer i belongs to text i+1, the last id is missing
+            return completion({str(i): SHIFT_TABLE[texts[i + 1]] for i in range(len(texts) - 1)})
+        return completion({str(i): SHIFT_TABLE[en] for i, en in enumerate(texts)})
+
+    env = Env(tmp_path, responder=responder)
+    report = env.runner.run([(f"k{i}", en) for i, en in enumerate(SHIFT_TEXTS)])
+    for i, en in enumerate(SHIFT_TEXTS):
+        assert env.cache.get(f"k{i}", en) == SHIFT_TABLE[en]
+    assert report.translated == 5
+    assert report.rejected == 0
+
+
+def test_three_length_violations_discard_the_whole_package(tmp_path):
+    texts = [
+        "The first long sentence about the reform of the national army and navy",
+        "The second long sentence about the economy, factories and the national debt",
+        "The third long sentence about elections, parties and the parliament today",
+        "The fourth long sentence about diplomacy, alliances and our neighbours",
+    ]
+    good = {en: f"Der {n}. lange Satz über die Reform, die Wirtschaft und das Parlament heute"
+            for n, en in enumerate(texts, 1)}
+    calls = Counter()
+
+    def responder(payload):
+        batch = json.loads(payload["messages"][1]["content"])
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return completion({"0": "Kurz", "1": "Kurz", "2": "Kurz", "3": "Falsche, aber unauffällig lange Antwort zum vierten Satz"})
+        return completion({i: good[en] for i, en in batch.items()})
+
+    env = Env(tmp_path, responder=responder)
+    env.runner.run([(f"k{i}", en) for i, en in enumerate(texts)])
+    assert env.cache.get("k3", texts[3]) == good[texts[3]]

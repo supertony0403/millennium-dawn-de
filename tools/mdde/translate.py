@@ -5,10 +5,15 @@ Flow per run:
 1. drop texts already in the cache (or already rejected, unless asked to retry)
    and send every distinct English text only once, even if several keys use it;
 2. round one: packages of <= 9000 characters / <= 100 texts, ``workers`` in
-   parallel; every valid answer goes to the cache immediately;
-3. round two: invalid or failed texts again in packages of 10; texts that are
+   parallel; every valid answer goes to the cache immediately, answers equal
+   to the English text go to the unchanged log instead (not requested again
+   unless ``retry_unchanged``);
+3. a package whose answers look shifted (>= 3 length-ratio violations, or
+   >= 2 answers that fit a neighbouring text but not their own) is discarded
+   as a whole: big packages go to round two, small ones are split in halves;
+4. round two: invalid or failed texts again in packages of 10; texts that are
    still invalid go to the reject log (the English text stays in the game);
-4. a budget (``Budget``) guards every request: ``--max-requests``, the free
+5. a budget (``Budget``) guards every request: ``--max-requests``, the free
    daily quota (checked at start and every 50 requests) and the reserve that
    is left for other applications.
 """
@@ -25,8 +30,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import validate
-from .cache import RejectLog, TranslationCache
-from .openrouter import AuthError, Client, NoModelAvailable, QuotaExhausted
+from .cache import RejectLog, TranslationCache, UnchangedLog
+from .openrouter import AuthError, BatchResult, Client, NoModelAvailable, QuotaExhausted
 
 SYSTEM_RULES = """Du übersetzt Lokalisierungstexte der Hearts-of-Iron-IV-Mod "Millennium Dawn" (moderne Geopolitik, 2000–2050) aus dem Englischen ins Deutsche.
 Regeln:
@@ -39,6 +44,8 @@ Regeln:
 - Verwende die Begriffe der offiziellen deutschen HOI4-Version:"""
 
 MAX_RESET_WAITS = 3
+SUSPECT_LENGTH_VIOLATIONS = 3  # length-ratio violations that discard a package
+SUSPECT_NEIGHBOUR_FITS = 2  # answers that fit a neighbour instead of their own text
 
 
 def load_glossary(path: Path) -> dict[str, str]:
@@ -84,6 +91,7 @@ class RunOptions:
     batch_items: int = 100
     retry_items: int = 10
     retry_rejects: bool = False
+    retry_unchanged: bool = False
 
 
 @dataclass
@@ -91,12 +99,14 @@ class RunReport:
     open_total: int = 0
     already_cached: int = 0
     skipped_rejects: int = 0
+    skipped_unchanged: int = 0
     todo: int = 0
     todo_texts: int = 0
     translated: int = 0
     unchanged: int = 0
     rejected: int = 0
     left_open: int = 0
+    shifted_packages: int = 0
     requests: int = 0
     stopped: str | None = None
     quota_remaining: int | None = None
@@ -183,10 +193,14 @@ class Budget:
 
 class Runner:
     def __init__(self, client: Client, cache: TranslationCache, rejects: RejectLog,
-                 opts: RunOptions, *, log_dir: Path, sleep: Callable[[float], None] = time.sleep,
+                 opts: RunOptions, *, log_dir: Path, unchanged: UnchangedLog | None = None,
+                 sleep: Callable[[float], None] = time.sleep,
                  now: Callable[[], datetime] | None = None,
                  out: Callable[[str], None] = lambda line: print(line, flush=True)) -> None:
         self.client, self.cache, self.rejects, self.opts = client, cache, rejects, opts
+        self.unchanged = unchanged if unchanged is not None else UnchangedLog(
+            cache.path.parent / "unchanged.jsonl"
+        )
         self.log_dir = Path(log_dir)
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._out = out
@@ -206,38 +220,79 @@ class Runner:
                 fh.write(f"{stamp} {line}\n")
 
     # -- one package -----------------------------------------------------------
-    def _process(self, texts: list[str], keys: Mapping[str, list[str]]) -> dict[str, tuple]:
-        """Translate one package; returns ``{en: (reason, model, de)}`` for failures."""
+    def _request(self, texts: list[str]) -> BatchResult | None:
+        """One package through the client; ``None`` once the run is stopped."""
         payload = {str(i): en for i, en in enumerate(texts)}
         while True:
             if self.budget.stopped:
-                return {en: ("skipped", None, None) for en in texts}
+                return None
             generation = self.budget.generation
             try:
-                result = self.client.translate_batch(payload)
-                break
+                return self.client.translate_batch(payload)
             except StopRun:
-                return {en: ("skipped", None, None) for en in texts}
+                return None
             except QuotaExhausted:
                 self.budget.on_daily_limit(generation)
             except (NoModelAvailable, AuthError) as exc:
                 self.log(f"Abbruch: {exc}")
                 self.budget.stop("auth" if isinstance(exc, AuthError) else "no-models")
+
+    @staticmethod
+    def _suspect(texts: list[str], answers: list[object]) -> bool:
+        """True if the answers of a package look shifted against their ids."""
+        bad_length = sum(
+            1 for en, de in zip(texts, answers) if isinstance(de, str) and not validate.length_ok(en, de)
+        )
+        if bad_length >= SUSPECT_LENGTH_VIOLATIONS:
+            return True
+        neighbour_fits = 0
+        for i, (en, de) in enumerate(zip(texts, answers)):
+            if not isinstance(de, str) or validate.check(en, de) is None:
+                continue
+            for j in (i - 1, i + 1):
+                other = texts[j] if 0 <= j < len(texts) else None
+                if (other is not None and other != en and validate.distinctive(other)
+                        and validate.check(other, de) is None):
+                    neighbour_fits += 1
+                    break
+        return neighbour_fits >= SUSPECT_NEIGHBOUR_FITS
+
+    def _split(self, texts: list[str], keys: Mapping[str, list[str]]) -> dict[str, tuple]:
+        mid = len(texts) // 2
+        failures = self._process(texts[:mid], keys)
+        failures.update(self._process(texts[mid:], keys))
+        return failures
+
+    def _process(self, texts: list[str], keys: Mapping[str, list[str]]) -> dict[str, tuple]:
+        """Translate one package; returns ``{en: (reason, model, de)}`` for failures."""
+        result = self._request(texts)
+        if result is None:
+            return {en: ("skipped", None, None) for en in texts}
         if not result.ok:
             return {en: ("batch", None, None) for en in texts}
-        failures: dict[str, tuple] = {}
-        for i, en in enumerate(texts):
-            de = result.texts.get(str(i))
-            reason = validate.check(en, de)
-            if reason is not None:
-                failures[en] = (reason, result.model, de)
-                continue
-            for key in keys[en]:
-                self.cache.put(key, en, de, result.model or "")
+        answers = [result.texts.get(str(i)) for i in range(len(texts))]
+        if len(texts) > 1 and self._suspect(texts, answers):
             with self._stats_lock:
-                self.report.translated += len(keys[en])
-                if de == en:
+                self.report.shifted_packages += 1
+            self.log(f"Paket mit {len(texts)} Texten verworfen ({result.model}): Antworten wirken verschoben")
+            if len(texts) > self.opts.retry_items:
+                return {en: ("shifted", result.model, None) for en in texts}
+            return self._split(texts, keys)
+        failures: dict[str, tuple] = {}
+        for en, de in zip(texts, answers):
+            reason = validate.check(en, de)
+            if reason == "unchanged":
+                for key in keys[en]:
+                    self.unchanged.add(key, en, result.model)
+                with self._stats_lock:
                     self.report.unchanged += len(keys[en])
+            elif reason is not None:
+                failures[en] = (reason, result.model, de)
+            else:
+                for key in keys[en]:
+                    self.cache.put(key, en, de, result.model or "")
+                with self._stats_lock:
+                    self.report.translated += len(keys[en])
         return failures
 
     def _round(self, number: int, texts: list[str], keys: Mapping[str, list[str]],
@@ -273,12 +328,15 @@ class Runner:
                 rep.already_cached += 1
             elif not self.opts.retry_rejects and self.rejects.contains(key, en):
                 rep.skipped_rejects += 1
+            elif not self.opts.retry_unchanged and self.unchanged.contains(key, en):
+                rep.skipped_unchanged += 1
             else:
                 keys.setdefault(en, []).append(key)
         rep.todo = sum(len(k) for k in keys.values())
         rep.todo_texts = len(keys)
         self.log(f"Start: {rep.open_total} offen, {rep.already_cached} im Cache, "
-                 f"{rep.skipped_rejects} bekannte Ablehner, {rep.todo} zu tun "
+                 f"{rep.skipped_rejects} bekannte Ablehner, {rep.skipped_unchanged} bekannt unveraendert, "
+                 f"{rep.todo} zu tun "
                  f"({rep.todo_texts} verschiedene Texte)")
         if keys:
             self.budget.start()
@@ -293,12 +351,12 @@ class Runner:
                         for key in keys[en]:
                             self.rejects.add(key, en, reason, model=model, de=de)
                         rep.rejected += len(keys[en])
-        rep.left_open = rep.todo - rep.translated - rep.rejected
+        rep.left_open = rep.todo - rep.translated - rep.rejected - rep.unchanged
         rep.requests = self.client.stats["requests"]
         rep.stopped = self.budget.reason
         rep.quota_remaining = self.budget.remaining
         self._write_summary(started)
-        self.log(f"Ende: {rep.translated} uebersetzt, {rep.rejected} abgelehnt, "
+        self.log(f"Ende: {rep.translated} uebersetzt, {rep.unchanged} unveraendert, {rep.rejected} abgelehnt, "
                  f"{rep.left_open} offen, {rep.requests} Anfragen"
                  + (f", gestoppt: {rep.stopped}" if rep.stopped else ""))
         return rep
