@@ -38,8 +38,11 @@ Flow per run:
    and counted down locally in between; within ``quota_every`` of
    ``reserve + workers`` it is queried before *every* request, and the run
    stops once the estimate reaches ``reserve + workers`` (requests still in
-   flight are covered by ``workers``). Within one UTC day a server value never
-   raises the local estimate (``/key`` may lag behind). Other programs using
+   flight are covered by ``workers``). Within a quota period a server value
+   never raises the local estimate (``/key`` may lag behind); after 00:00 UTC
+   a jump of more than ``quota_every + workers`` above it is the daily reset.
+   A failed query is retried after ``quota_every`` requests (near the end
+   after ``KEY_RETRY_EVERY``), outside the budget lock. Other programs using
    the same key between two queries can still eat into the reserve, so it is
    kept on a best-effort basis ("nach bestem Bemuehen"), not guaranteed. An
    unknown quota stops the run unless ``allow_unknown_quota`` is set;
@@ -257,7 +260,7 @@ class Budget:
         self.reason: str | None = None
         self.remaining: int | None = None  # last value reported by /key
         self._base: int | None = None  # upper bound of remaining at the last successful query
-        self._base_day = None  # UTC date of ``_base``
+        self._period_day = None  # UTC date the current quota period was first seen
         self._used_at_check = 0  # ``used`` when the last successful query was sent
         self._last_try = 0  # ``used`` when the last query was sent (successful or not)
         self._failures = 0  # failed queries in a row
@@ -426,12 +429,25 @@ class Budget:
             self._take(self._quota(), self.used)
 
     def _accept(self, remaining: int, at: int) -> None:  # lock held
-        """Take a server value; within one UTC day it may only lower the estimate."""
+        """Take a server value. Within a quota period it may only lower the estimate
+        (``/key`` may lag behind). After 00:00 UTC a value more than ``quota_every +
+        workers`` above what our own requests leave is the daily reset - even when the
+        first query of the new day still showed the old value: a new base, and the
+        external rate starts from zero."""
         self.remaining = remaining
         day = self._now().date()
         sent = at - self._used_at_check
-        if self._base is not None and day == self._base_day:
-            bound = self._base - sent  # our own requests are certainly gone
+        bound = None if self._base is None else self._base - sent  # our requests are gone
+        if bound is None or (day > self._period_day
+                             and remaining > bound + self.opts.quota_every + self.opts.workers):
+            if bound is not None:
+                self._log(f"Neues Tageskontingent erkannt: {remaining} statt hoechstens {bound} "
+                          f"- Fremdnutzung wird neu gemessen")
+            self._own = self._external = 0
+            self._intervals.clear()
+            self._measured = False
+            self._period_day = day
+        else:
             if sent:
                 # a negative difference (requests still on the way, a lagging /key) is
                 # carried by the min() below and evens out at the next query
@@ -441,11 +457,7 @@ class Budget:
                 self._intervals.append((sent, external))
                 self._measured = True
             remaining = min(remaining, bound)  # a lagging /key must not raise it
-        else:  # first query or a new UTC day
-            self._own = self._external = 0
-            self._intervals.clear()
-            self._measured = False
-        self._base, self._base_day = remaining, day
+        self._base = remaining
         self._used_at_check = at
 
     def _sleep_until_reset(self) -> None:  # lock held

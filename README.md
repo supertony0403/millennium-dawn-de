@@ -79,8 +79,12 @@ Lange Übersetzungsläufe vor dem Standby schützen:
    Das Tageskontingent wird alle 10 Anfragen abgefragt und dazwischen lokal
    heruntergezählt, nahe der Reserve vor jeder Anfrage; der Lauf stoppt, bevor die Reserve
    angetastet wird – nach bestem Bemühen: Was andere Programme mit demselben Schlüssel
-   (z. B. der Discord-Bot) verbrauchen, wird gemessen und vorausgeschätzt, ein verzögert
-   zu hoher Serverwert hebt die Schätzung nie an; eine Garantie ist das nicht. Ist das Kontingent nicht abfragbar, startet der Lauf
+   (z. B. der Discord-Bot) verbrauchen, wird gemessen und vorausgeschätzt (Anteil über den
+   ganzen Lauf bzw. die letzten 10 eigenen Anfragen, der höhere zählt), ein verzögert zu hoher
+   Serverwert hebt die Schätzung nie an – außer nach 00:00 UTC ein Sprung um mehr als
+   10 + parallele Anfragen: das ist das neue Tageskontingent. Schlägt die Abfrage fehl, wird
+   lokal weitergezählt und nach 10 (nahe der Reserve nach 5) Anfragen erneut gefragt, ohne
+   die anderen Worker aufzuhalten; eine Garantie ist das alles nicht. Ist das Kontingent nicht abfragbar, startet der Lauf
    gar nicht erst (außer mit `--allow-unknown-quota`). Strg+C oder SIGTERM: keine neuen
    Anfragen mehr, laufende Antworten werden noch gesichert. Es läuft immer nur ein
    `translate` gleichzeitig (Sperre `cache/translate.lock`). Die Fortschrittszeile zeigt

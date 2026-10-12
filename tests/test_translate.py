@@ -847,6 +847,57 @@ def test_a_new_utc_day_accepts_the_higher_quota(tmp_path):
     assert budget.estimate() == 500
 
 
+def test_a_lagging_key_after_midnight_does_not_cap_the_new_day():
+    # review 3, W2: the first query after 00:00 UTC still shows the old day's value
+    from mdde.translate import Budget
+
+    values = [200, 190, 185, 990]
+    day = [datetime(2026, 10, 12, 23, 59, tzinfo=timezone.utc)]
+    log = []
+    budget = Budget(lambda: {"remaining": values.pop(0)}, RunOptions(workers=1, reserve=100), None,
+                    lambda: day[0], log.append)
+    budget.start()
+    for _ in range(5):
+        budget()  # the query after the first request measures 9 requests of another program
+    assert budget.threshold == 100 + 1 * (1 + 9)
+    day[0] = datetime(2026, 10, 13, 0, 1, tzinfo=timezone.utc)
+    budget._check_quota()  # 185: lagging, no reset yet
+    assert budget.estimate() == 185
+    budget._check_quota()  # 990: the new day's quota (before the fix: capped at 185)
+    assert budget.estimate() == 990
+    assert budget.threshold == 100 + 1  # the external rate starts from zero
+    assert any("Neues Tageskontingent" in line for line in log)
+
+
+@pytest.mark.parametrize("after_midnight,expected", [(197, 186), (198, 198)])
+def test_after_midnight_only_a_jump_beyond_quota_every_plus_workers_is_the_reset(after_midnight, expected):
+    from mdde.translate import Budget
+
+    values = [200, 190, after_midnight]
+    day = [datetime(2026, 10, 12, 23, 59, tzinfo=timezone.utc)]
+    budget = Budget(lambda: {"remaining": values.pop(0)}, RunOptions(workers=1, reserve=100), None,
+                    lambda: day[0], lambda line: None)
+    budget.start()
+    for _ in range(5):
+        budget()
+    day[0] = datetime(2026, 10, 13, 0, 1, tzinfo=timezone.utc)
+    budget._check_quota()  # at most 190 - 4 = 186 left; 197 is within 10 + 1 of it
+    assert budget.estimate() == expected
+
+
+def test_a_jump_within_the_same_utc_day_never_raises_the_estimate():
+    from mdde.translate import Budget
+
+    values = [200, 199, 500]
+    budget = Budget(lambda: {"remaining": values.pop(0)}, RunOptions(workers=1, reserve=100), None,
+                    lambda: NOON, lambda line: None)
+    budget.start()
+    for _ in range(5):
+        budget()
+    budget._check_quota()  # 500 at noon: a stale or wrong value, not the daily reset
+    assert budget.estimate() == 195
+
+
 def test_unknown_quota_stops_before_any_request(tmp_path):
     live = LiveQuota(1000, key_fails_after=0)
     report = live_runner(tmp_path, live, workers=1).run(sentences(5))
