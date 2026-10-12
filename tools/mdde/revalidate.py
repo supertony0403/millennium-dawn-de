@@ -90,7 +90,10 @@ def revalidate(md_root: Path, cache_path: Path, rejects: RejectLog, unchanged: U
                apply: bool = False, examples: int = 3, now: datetime | None = None) -> RevalidateReport:
     report = RevalidateReport()
     cache_path = Path(cache_path)
-    lines = cache_path.read_text(encoding="utf-8").splitlines() if cache_path.exists() else []
+    # split at "\n" only: splitlines() would also split at U+2028 inside a JSON string
+    lines = cache_path.read_text(encoding="utf-8").split("\n") if cache_path.exists() else []
+    if lines and lines[-1] == "":
+        lines.pop()
     records: list[dict | None] = []
     latest: dict[tuple[str, str], int] = {}
     for i, line in enumerate(lines):

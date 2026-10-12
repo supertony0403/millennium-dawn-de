@@ -177,3 +177,26 @@ def test_cli_repair_rejects_is_a_dry_run_and_needs_no_md(reject_dir, tmp_path, m
     assert (reject_dir / "translations.jsonl").read_bytes() == before
     assert main(["revalidate", "--repair-rejects", "--apply"]) == 0
     assert TranslationCache(reject_dir / "translations.jsonl").get("a", "Line one\\nLine two") is not None
+
+
+# -- review 2, k-3: lines are split at \n only ---------------------------------------------
+def test_unicode_line_separator_inside_a_record_does_not_break_the_line(md_root, tmp_path):
+    stale = record("GER_event_title", "Old English text", "Alter Text")  # English changed: keep as is
+    current = record("GER_focus_unity", "German Unity", "Deutsche Einheit")
+    path = tmp_path / "translations.jsonl"
+    path.write_text(stale + "\n" + current + "\n", encoding="utf-8")
+    rejects = RejectLog(tmp_path / "r.jsonl")
+    report = revalidate(md_root, path, rejects, UnchangedLog(tmp_path / "u.jsonl"), apply=True)
+    assert report.broken == 0
+    assert report.stale == 1
+    assert report.by_reason == {"newline": 1}
+    assert path.read_text(encoding="utf-8") == stale + "\n"
+    assert rejects.contains("GER_focus_unity", "German Unity")
+
+
+def test_cache_reads_records_with_unicode_line_separators(tmp_path):
+    path = tmp_path / "translations.jsonl"
+    path.write_text(record("k", "German Unity", "Deutsche Einheit") + "\n", encoding="utf-8")
+    cache = TranslationCache(path)
+    assert cache.get("k", "German Unity") == "Deutsche Einheit"
+    assert cache.skipped == 0

@@ -272,3 +272,9 @@ def test_unchanged_but_obviously_translatable(en):
 )
 def test_legitimately_unchanged_texts_are_not_translatable(en):
     assert not looks_translatable(en)
+
+
+# -- review 2, k-3: Unicode line separators are line breaks too ---------------------------
+@pytest.mark.parametrize("sep", [" ", " ", "\u0085"])
+def test_unicode_line_separators_are_rejected(sep):
+    assert check("German Unity now", f"Deutsche Einheit{sep}jetzt") == "newline"

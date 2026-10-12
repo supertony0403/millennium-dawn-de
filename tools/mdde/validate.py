@@ -45,6 +45,8 @@ def normalized(text: str) -> str:
 # Characters that start tokens; an extra stray one breaks formatting (a dropped
 # one, e.g. "$21 billion" -> "21 Mrd. US-Dollar", is harmless).
 _SPECIAL_CHARS = "§£$[]"
+# every character str.splitlines() breaks at (U+2028 etc. would tear JSONL lines apart)
+_LINE_BREAKS = frozenset("\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029")
 _TRAILING_BACKSLASH_RE = re.compile(r"(?<!\\)(?:\\\\)*\\$")
 _ESCAPE_RE = re.compile(r"\\(.)", re.S)
 _ALLOWED_ESCAPES = frozenset('n"')
@@ -276,7 +278,7 @@ def check(en: str, de: object) -> str | None:
     """Return ``None`` if ``de`` is a usable translation of ``en``, else a reason:
 
     ``empty``      missing, not a string or blank
-    ``newline``    contains a real line break (HOI4 needs the ``\\n`` token)
+    ``newline``    contains a real line break, also U+2028/U+2029/U+0085 (HOI4 needs ``\\n``)
     ``backslash``  ends with a lone backslash, or has escapes other than ``\\n``/``\\"``
     ``tokens``     formatting tokens or token characters differ from the source
     ``order``      a colour span is closed before it is opened
@@ -288,7 +290,7 @@ def check(en: str, de: object) -> str | None:
     """
     if not isinstance(de, str) or not de.strip():
         return "empty"
-    if "\n" in de or "\r" in de:
+    if not _LINE_BREAKS.isdisjoint(de):
         return "newline"
     if _TRAILING_BACKSLASH_RE.search(de) or foreign_escapes(en, de):
         return "backslash"
