@@ -7,7 +7,10 @@ Flow per run:
 2. round one: packages of <= 9000 characters / <= 100 texts, ``workers`` in
    parallel; every valid answer goes to the cache immediately, answers equal
    to the English text go to the unchanged log instead (not requested again
-   unless ``retry_unchanged``);
+   unless ``retry_unchanged`` is ``"all"`` - or ``"translatable"`` for those
+   that ``validate.looks_translatable``) - except texts that obviously still
+   need German: they are asked again in round two, with the next model of the
+   chain first, and only an unchanged answer there goes to the log;
 3. a package whose answers look shifted (>= 3 length-ratio violations,
    >= 2 answers that fit a neighbouring text but not their own, or answer
    lengths that match the neighbouring texts far better than their own) is
@@ -120,7 +123,7 @@ class RunOptions:
     batch_items: int = 100
     retry_items: int = 10
     retry_rejects: bool = False
-    retry_unchanged: bool = False
+    retry_unchanged: bool | str = False  # False | "all" (or True) | "translatable"
 
 
 @dataclass
@@ -399,7 +402,7 @@ class Runner:
                 fh.write(f"{stamp} {line}\n")
 
     # -- one package -----------------------------------------------------------
-    def _request(self, texts: list[str]) -> BatchResult | None:
+    def _request(self, texts: list[str], avoid: str | None = None) -> BatchResult | None:
         """One package through the client; ``None`` once the run is stopped."""
         payload = {str(i): en for i, en in enumerate(texts)}
         while True:
@@ -407,7 +410,7 @@ class Runner:
                 return None
             generation = self.budget.generation
             try:
-                return self.client.translate_batch(payload)
+                return self.client.translate_batch(payload, avoid=avoid)
             except StopRun:
                 return None
             except QuotaExhausted:
@@ -442,15 +445,21 @@ class Runner:
         """True if the answers of a package look shifted against their ids."""
         return Runner._diagnose(texts, answers) is not None
 
-    def _split(self, texts: list[str], keys: Mapping[str, list[str]]) -> dict[str, tuple]:
+    def _split(self, texts: list[str], keys: Mapping[str, list[str]], final: bool,
+               avoid: str | None) -> dict[str, tuple]:
         mid = len(texts) // 2
-        failures = self._process(texts[:mid], keys)
-        failures.update(self._process(texts[mid:], keys))
+        failures = self._process(texts[:mid], keys, final, avoid)
+        failures.update(self._process(texts[mid:], keys, final, avoid))
         return failures
 
-    def _process(self, texts: list[str], keys: Mapping[str, list[str]]) -> dict[str, tuple]:
-        """Translate one package; returns ``{en: (reason, model, de)}`` for failures."""
-        result = self._request(texts)
+    def _process(self, texts: list[str], keys: Mapping[str, list[str]], final: bool = False,
+                 avoid: str | None = None) -> dict[str, tuple]:
+        """Translate one package; returns ``{en: (reason, model, de)}`` for failures.
+
+        ``final`` is the last round: an unchanged answer always goes to the
+        unchanged log there; before, a translatable one is a failure (retried).
+        """
+        result = self._request(texts, avoid)
         if result is None:
             return {en: ("skipped", None, None) for en in texts}
         if result.moderated:
@@ -458,7 +467,7 @@ class Runner:
                 self.log(f"Moderation ({result.model}) sperrt einen Text - kommt in die Ablehnungen")
                 return {texts[0]: ("moderation", result.model, None)}
             self.log(f"Moderation ({result.model}) sperrt ein Paket mit {len(texts)} Texten - teile auf")
-            return self._split(texts, keys)
+            return self._split(texts, keys, final, avoid)
         if not result.ok:
             return {en: ("batch", None, None) for en in texts}
         raw = [result.texts.get(str(i)) for i in range(len(texts))]
@@ -473,14 +482,16 @@ class Runner:
                      f"z. B. {keys[texts[suspicion.index]][0]}")
             if len(texts) > self.opts.retry_items:
                 return {en: ("shifted", result.model, None) for en in texts}
-            return self._split(texts, keys)
+            return self._split(texts, keys, final, avoid)
         if repaired:
             with self._stats_lock:
                 self.report.repaired_escapes += repaired
         failures: dict[str, tuple] = {}
         for en, de in zip(texts, answers):
             reason = validate.check(en, de)
-            if reason == "unchanged":
+            if reason == "unchanged" and not final and validate.looks_translatable(en):
+                failures[en] = (reason, result.model, de)  # second chance, other model first
+            elif reason == "unchanged":
                 for key in keys[en]:
                     self.unchanged.add(key, en, result.model)
                 with self._stats_lock:
@@ -494,14 +505,16 @@ class Runner:
                     self.report.translated += len(keys[en])
         return failures
 
-    def _round(self, number: int, texts: list[str], keys: Mapping[str, list[str]],
-               max_items: int) -> dict[str, tuple]:
-        batches = make_batches([(en, en) for en in texts], self.opts.batch_chars, max_items)
+    def _round(self, number: int, groups: Mapping[str | None, list[str]], keys: Mapping[str, list[str]],
+               max_items: int, final: bool) -> dict[str, tuple]:
+        """One round; ``groups`` maps a model to avoid (or ``None``) to its texts."""
+        batches = [([en for en, _ in b], avoid) for avoid, texts in groups.items()
+                   for b in make_batches([(en, en) for en in texts], self.opts.batch_chars, max_items)]
         failures: dict[str, tuple] = {}
         started = self._now()
         pool = ThreadPoolExecutor(max_workers=self.opts.workers)
         try:
-            futures = [pool.submit(self._process, [en for en, _ in b], keys) for b in batches]
+            futures = [pool.submit(self._process, texts, keys, final, avoid) for texts, avoid in batches]
             for done, future in enumerate(as_completed(futures), 1):
                 failed = future.result()
                 failures.update(failed)
@@ -552,12 +565,15 @@ class Runner:
         unique = list(dict.fromkeys(units))
         rep.open_total = len(unique)
         keys: dict[str, list[str]] = {}
+        mode = self.opts.retry_unchanged
         for key, en in unique:
             if self.cache.get(key, en) is not None:
                 rep.already_cached += 1
             elif not self.opts.retry_rejects and self.rejects.contains(key, en):
                 rep.skipped_rejects += 1
-            elif not self.opts.retry_unchanged and self.unchanged.contains(key, en):
+            elif self.unchanged.contains(key, en) and not (
+                    mode is True or mode == "all"
+                    or (mode == "translatable" and validate.looks_translatable(en))):
                 rep.skipped_unchanged += 1
             else:
                 keys.setdefault(en, []).append(key)
@@ -571,12 +587,15 @@ class Runner:
         self.budget.start()
         if self.budget.stopped:
             return
-        first = self._round(1, list(keys), keys, self.opts.batch_items)
+        first = self._round(1, {None: list(keys)}, keys, self.opts.batch_items, final=False)
         self._reject({en: f for en, f in first.items() if f[0] in FINAL_REASONS}, keys)
-        retry = [en for en, f in first.items() if f[0] not in ("skipped", *FINAL_REASONS)]
+        retry: dict[str | None, list[str]] = {}
+        for en, (reason, model, _) in first.items():
+            if reason not in ("skipped", *FINAL_REASONS):
+                retry.setdefault(model if reason == "unchanged" else None, []).append(en)
         if not retry or self.budget.stopped:
             return
-        second = self._round(2, retry, keys, self.opts.retry_items)
+        second = self._round(2, retry, keys, self.opts.retry_items, final=True)
         self._reject({en: f for en, f in second.items() if f[0] not in ("batch", "skipped")}, keys)
 
     def _reject(self, failures: Mapping[str, tuple], keys: Mapping[str, list[str]]) -> None:

@@ -28,8 +28,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="auch laufen, wenn das Tageskontingent nicht abfragbar ist (ohne Reserve-Schutz)")
     p.add_argument("--retry-rejects", action="store_true",
                    help="auch Texte erneut versuchen, die schon in rejects.jsonl stehen")
-    p.add_argument("--retry-unchanged", action="store_true",
-                   help="auch Texte erneut anfragen, die das Modell unveraendert zurueckgab (unchanged.jsonl)")
+    p.add_argument("--retry-unchanged", nargs="?", const="all", default=None, choices=("all", "translatable"),
+                   help="Texte aus unchanged.jsonl erneut anfragen: alle (Standard) oder nur die, "
+                        "die noch uebersetzbar wirken (=translatable)")
 
     p = sub.add_parser("revalidate", help="Cache mit dem aktuellen Validator neu pruefen (Standard: Probelauf)")
     mode = p.add_mutually_exclusive_group()

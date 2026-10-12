@@ -127,7 +127,7 @@ def _translate(args: argparse.Namespace, cfg: Config) -> int:
             wait_for_reset=args.wait_for_reset,
             allow_unknown_quota=args.allow_unknown_quota,
             retry_rejects=args.retry_rejects,
-            retry_unchanged=args.retry_unchanged,
+            retry_unchanged=args.retry_unchanged or False,
         ),
         log_dir=cfg.log_dir,
         unchanged=UnchangedLog(cfg.unchanged_path),

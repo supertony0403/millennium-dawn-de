@@ -223,3 +223,52 @@ def test_repair_leaves_other_texts_alone(en, de):
 
 def test_repair_ignores_non_strings():
     assert repair_escapes("x", None) is None
+
+
+# -- review 2, W-4: unchanged answers that obviously still need German -------------------
+from mdde.validate import looks_translatable  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "en",
+    [
+        "§YToggle Cheat Decisions§!",
+        "§REnd§! USAID",
+        "Islamic Emirate of Arabia",
+        "the Islamic Emirate of Tajikistan",
+        "Army Leader Cost: $RIGHT|-=%1$",
+        "§CAntarctic Treaty Consultative Parties§!",
+        "Kharkiv People's Republic",
+        "§GActive§!",
+        "§YPrerequisites:§!\\n[!eu_parliament_president_back_click_enabled]",
+        "We must reform the economy before the election.",
+        "Stability Bonus",
+        "Level [?ROOT.MD_ftc_academy_level|0]/3",
+        "§GHIRED§!",
+        "§RMISSING§!",
+    ],
+)
+def test_unchanged_but_obviously_translatable(en):
+    assert looks_translatable(en)
+
+
+@pytest.mark.parametrize(
+    "en",
+    [
+        "Opposition",
+        "Initiative: $RIGHT|+=%1$",
+        "ExxonMobil",
+        "Maghreb",
+        "Fabiola Gianotti",
+        "Wörth am Rhein",
+        "Osama bin Laden",
+        "Ansar al-Sharia",
+        "Manuel Pinto da Costa.",
+        "§R[?temp_apc_equipment_cost|3R]b/CPW§!",
+        "[1182.owner.GetAdjective] Dollar",
+        "NATO",
+        "§Y$VALUE$§!",
+    ],
+)
+def test_legitimately_unchanged_texts_are_not_translatable(en):
+    assert not looks_translatable(en)

@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from fakes import FakeSleep, FakeTransport, completion, error
 
-from mdde.cache import RejectLog, TranslationCache
+from mdde.cache import RejectLog, TranslationCache, UnchangedLog
 from mdde.openrouter import Client
 from mdde.translate import (
     RunOptions,
@@ -489,6 +489,67 @@ def test_doubly_escaped_answers_are_repaired_and_cached(tmp_path):
     assert report.rejected == 0
     assert report.repaired_escapes == 2
     assert len(env.chat_calls) == 1
+
+
+# -- review 2, W-4: unchanged but translatable answers get a second chance ----------------
+TOGGLE = "§YToggle Cheat Decisions§!"
+
+
+def two_models(tmp_path, m1, m2, **opts):
+    """Runner over a client with the chain m1 -> m2; ``m1``/``m2`` answer a batch dict."""
+    calls = []
+
+    def route(method, url, headers, body, timeout):
+        if method == "GET":
+            return quota_payload(1000)
+        payload = json.loads(body)
+        batch = json.loads(payload["messages"][1]["content"])
+        calls.append((payload["model"], sorted(batch.values())))
+        return completion((m1 if payload["model"] == "m1" else m2)(batch))
+
+    client = Client(KEY, ["m1", "m2"], system_prompt="S", transport=route, sleep=FakeSleep())
+    cache = TranslationCache(tmp_path / "cache" / "translations.jsonl")
+    runner = Runner(client, cache, RejectLog(tmp_path / "cache" / "rejects.jsonl"), RunOptions(workers=1, **opts),
+                    log_dir=tmp_path / "logs", sleep=FakeSleep(), out=lambda line: None)
+    return runner, cache, calls
+
+
+def echo(batch):
+    return dict(batch)
+
+
+def german(batch):
+    return {i: "§YCheat-Entscheidungen umschalten§!" if en == TOGGLE else f"Deutsch {en}"
+            for i, en in batch.items()}
+
+
+def test_translatable_unchanged_answer_is_asked_again_with_the_next_model(tmp_path):
+    runner, cache, calls = two_models(tmp_path, echo, german)
+    report = runner.run([("tog", TOGGLE), ("opp", "Opposition")])
+    assert calls == [("m1", sorted([TOGGLE, "Opposition"])), ("m2", [TOGGLE])]
+    assert cache.get("tog", TOGGLE) == "§YCheat-Entscheidungen umschalten§!"
+    assert report.translated == 1 and report.unchanged == 1 and report.rejected == 0
+    unchanged = UnchangedLog(tmp_path / "cache" / "unchanged.jsonl")
+    assert unchanged.contains("opp", "Opposition") and not unchanged.contains("tog", TOGGLE)
+
+
+def test_translatable_text_unchanged_twice_goes_to_the_unchanged_log(tmp_path):
+    runner, cache, calls = two_models(tmp_path, echo, echo)
+    report = runner.run([("tog", TOGGLE)])
+    assert [model for model, _ in calls] == ["m1", "m2"]
+    assert report.unchanged == 1 and report.rejected == 0 and report.left_open == 0
+    assert UnchangedLog(tmp_path / "cache" / "unchanged.jsonl").contains("tog", TOGGLE)
+
+
+@pytest.mark.parametrize("mode,expected", [("translatable", [TOGGLE]), ("all", sorted([TOGGLE, "Opposition"])),
+                                           (True, sorted([TOGGLE, "Opposition"])), (False, [])])
+def test_retry_unchanged_can_be_limited_to_translatable_texts(tmp_path, mode, expected):
+    log = UnchangedLog(tmp_path / "cache" / "unchanged.jsonl")
+    log.add("tog", TOGGLE, "m1")
+    log.add("opp", "Opposition", "m1")
+    runner, cache, calls = two_models(tmp_path, german, german, retry_unchanged=mode)
+    runner.run([("tog", TOGGLE), ("opp", "Opposition")])
+    assert sorted(en for _, batch in calls for en in batch) == expected
 
 
 # -- review finding K1: the reserve is never undercut ---------------------------------

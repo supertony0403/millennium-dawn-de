@@ -274,11 +274,17 @@ class Client:
         self._count(f"model:{model}")
         return BatchResult({k: v for k, v in obj.items() if k in batch}, model, True)
 
-    def translate_batch(self, batch: Mapping[str, str]) -> BatchResult:
-        """Translate ``{id: english}``; values are returned unvalidated."""
+    def translate_batch(self, batch: Mapping[str, str], avoid: str | None = None) -> BatchResult:
+        """Translate ``{id: english}``; values are returned unvalidated.
+
+        ``avoid`` moves that model to the end of the chain (a second opinion).
+        """
         fail_rounds = waits = 0
         while True:
             chain = [m for m in self.models if m not in self.disabled]
+            if avoid in chain and len(chain) > 1:
+                chain.remove(avoid)
+                chain.append(avoid)
             if not chain:
                 raise NoModelAvailable("alle Modelle der Kette sind gesperrt (403/404)")
             transient = rate_limited = False

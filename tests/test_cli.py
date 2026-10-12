@@ -166,3 +166,14 @@ def test_second_translate_run_is_refused_while_one_is_running(env, monkeypatch, 
         assert main(["translate"]) == 1
     assert transport.calls == []
     assert "laeuft bereits" in capsys.readouterr().err
+
+
+def test_retry_unchanged_option_accepts_translatable():
+    from mdde.__main__ import build_parser
+
+    parser = build_parser()
+    assert parser.parse_args(["translate"]).retry_unchanged is None
+    assert parser.parse_args(["translate", "--retry-unchanged"]).retry_unchanged == "all"
+    assert parser.parse_args(["translate", "--retry-unchanged=translatable"]).retry_unchanged == "translatable"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["translate", "--retry-unchanged=some"])

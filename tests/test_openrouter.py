@@ -330,3 +330,18 @@ def test_header_error_from_transport_is_masked():
     text = "".join(traceback.format_exception(excinfo.value))
     assert KEY not in text
     assert all(KEY not in e for e in client.errors)
+
+
+# -- review 2, W-4: ask a different model first ----------------------------------------
+def test_avoided_model_is_tried_last():
+    transport = FakeTransport([completion(GOOD)])
+    result = make_client(transport).translate_batch(BATCH, avoid=M1)
+    assert [c.model for c in transport.calls] == [M2]
+    assert result.model == M2
+
+
+def test_avoided_model_still_answers_when_the_others_fail():
+    transport = FakeTransport([error(500), completion(GOOD)])
+    result = make_client(transport).translate_batch(BATCH, avoid=M1)
+    assert [c.model for c in transport.calls] == [M2, M1]
+    assert result.ok and result.model == M1

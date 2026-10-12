@@ -146,6 +146,40 @@ def stale_english(en: str, de: str) -> bool:
     return sum(w in source for w in lower) / len(lower) > 0.6
 
 
+# Words that mark an English text as translatable even when a model returned it
+# unchanged: function words, UI verbs/nouns of HOI4 and the generic parts of
+# state and party names (Millennium Dawn's own German translates those).
+TRANSLATABLE_HINTS = ENGLISH_STOPWORDS | frozenset(
+    {"on", "off", "end", "not", "or", "if", "when", "per", "into", "over", "under", "without",
+     "against", "between", "after", "before", "toggle", "cost", "costs", "bonus", "active", "inactive",
+     "enable", "enabled", "disable", "disabled", "increase", "decrease", "add", "remove", "show", "hide",
+     "requires", "required", "prerequisites", "effects", "current", "total", "strength", "worst", "best",
+     "level", "hired", "missing",
+     "republic", "kingdom", "empire", "federation", "union", "people", "party", "movement", "army",
+     "front", "council", "state", "states"}
+)
+# Lower-case particles of proper names ("Osama bin Laden", "Wörth am Rhein").
+NAME_PARTICLES = frozenset(
+    {"de", "da", "di", "del", "della", "der", "den", "van", "von", "zu", "al", "el", "bin", "ibn", "bint",
+     "abu", "la", "le", "du", "des", "dos", "do", "das", "am", "im", "an", "und", "ul", "ud"}
+)
+
+
+def looks_translatable(en: str) -> bool:
+    """True if an English text that a model returned unchanged obviously still
+    needs a German version: a lower-case word (not a name particle), a word of
+    ``TRANSLATABLE_HINTS`` (short all-caps words are acronyms and skipped), or
+    formatting tokens together with at least two words. Proper names in title
+    case ("Fabiola Gianotti", "ExxonMobil") and "Initiative: $RIGHT|+=%1$" stay
+    as they are."""
+    found = words(en, lower=False)
+    if any(w.islower() and len(w) >= 2 and w not in NAME_PARTICLES for w in found):
+        return True
+    if any(w.lower() in TRANSLATABLE_HINTS for w in found if not (w.isupper() and len(w) <= 3)):
+        return True
+    return bool(TOKEN_RE.search(en)) and sum(len(w) >= 3 for w in found) >= 2
+
+
 def is_unchanged(en: str, de: str) -> bool:
     """``de`` equals ``en`` (ignoring case and whitespace) and ``en`` is real text."""
     return has_text(en) and normalized(de) == normalized(en)

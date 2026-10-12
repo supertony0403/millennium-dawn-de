@@ -38,6 +38,7 @@ python3 -m mdde translate                # übersetzt offene Texte (Scope german
 python3 -m mdde translate --max-requests 3          # Probelauf
 python3 -m mdde translate --wait-for-reset          # bei leerem Kontingent bis 00:00 UTC warten
 python3 -m mdde translate --retry-unchanged         # unveränderte Antworten erneut anfragen
+python3 -m mdde translate --retry-unchanged=translatable  # … nur die, die noch übersetzbar wirken
 python3 -m mdde revalidate               # Cache mit dem aktuellen Validator prüfen (Probelauf)
 python3 -m mdde revalidate --apply       # … und bereinigen (vorher Backup)
 python3 -m mdde revalidate --repair-rejects          # doppelt escapte \\n in rejects.jsonl reparieren (Probelauf)
@@ -55,7 +56,12 @@ Lange Übersetzungsläufe vor dem Standby schützen:
 1. `status` – zeigt, wie viel zu tun ist (und wie viele Anfragen das ungefähr kostet).
 2. `translate` – jedes gültige Ergebnis landet sofort in `cache/translations.jsonl`;
    Antworten, die dem Englischen gleichen, landen in `cache/unchanged.jsonl` und werden
-   nur mit `--retry-unchanged` erneut angefragt. Ungültige Texte bekommen eine zweite Runde
+   nur mit `--retry-unchanged` (alle) bzw. `--retry-unchanged=translatable` erneut
+   angefragt. Wirkt ein solcher Text noch übersetzbar (kleingeschriebene oder englische
+   Funktionswörter wie „of“, „the“, „Toggle“, „Cost“, Formatierung plus Wörter), fragt
+   Runde zwei ihn zuerst beim nächsten Modell der Kette erneut an; erst wenn er auch dort
+   unverändert bleibt, kommt er nach `unchanged.jsonl`. Eigennamen („ExxonMobil“,
+   „Maghreb“, „Opposition“) gehen direkt dorthin. Ungültige Texte bekommen eine zweite Runde
    in kleinen Paketen, danach landen sie in `cache/rejects.jsonl` (im Spiel bleibt dann der
    englische Text stehen). Ein Paket, dessen Antworten verschoben wirken, wird ganz
    verworfen und kleiner wiederholt; sperrt die Inhaltsmoderation des Anbieters ein Paket
