@@ -7,6 +7,7 @@ import sys
 from collections import Counter
 
 from . import build as buildmod
+from . import install as installmod
 from . import openrouter, scope
 from .build import md_version
 from .cache import RejectLog, TranslationCache
@@ -125,9 +126,29 @@ def cmd_check(args: argparse.Namespace, cfg: Config) -> int:
     return report.exit_code
 
 
-def _not_implemented(args: argparse.Namespace, cfg: Config) -> int:
-    print(f"'{args.command}' ist noch nicht implementiert", file=sys.stderr)
-    return 3
+def cmd_install(args: argparse.Namespace, cfg: Config) -> int:
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("Bestaetigung fehlt: Paradox-Launcher schliessen und mit --yes ausfuehren",
+                  file=sys.stderr)
+            return 1
+        answer = input("Paradox-Launcher geschlossen? Launcher-Datenbank jetzt aendern? [j/N] ")
+        if answer.strip().lower() not in ("j", "ja", "y", "yes"):
+            print("Abgebrochen.")
+            return 1
+    try:
+        report = installmod.install(cfg.mod_root, cfg.hoi4_dir, running=installmod.launcher_running)
+    except installmod.InstallError as exc:
+        print(f"Installation abgebrochen: {exc}", file=sys.stderr)
+        return 1
+    print(f"Zeiger:  {report.pointer}")
+    print(f"Backup:  {report.backup}")
+    print(f"Playset '{report.playset}': eingetragen direkt hinter Millennium Dawn "
+          f"(Position {report.position}, aktiviert)")
+    if not report.md_enabled:
+        print("WARNUNG: Millennium Dawn selbst ist in diesem Playset deaktiviert")
+    print("dlc_load.json " + ("ergaenzt" if report.dlc_load_changed else "war schon aktuell"))
+    return 0
 
 
 HANDLERS = {
@@ -135,7 +156,7 @@ HANDLERS = {
     "translate": cmd_translate,
     "build": cmd_build,
     "check": cmd_check,
-    "install": _not_implemented,
+    "install": cmd_install,
 }
 
 
