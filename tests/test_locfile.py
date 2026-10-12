@@ -157,3 +157,25 @@ def test_escape_value(raw, escaped):
 def test_escape_value_rejects_breaking_input(bad):
     with pytest.raises(ValueError):
         locfile.escape_value(bad)
+
+
+# -- review finding (small 5): trailing comment that contains quotes ----------------------
+@pytest.mark.parametrize(
+    "line,val,trail",
+    [
+        (' KEY:0 "Wert" # alt: "Old value"', "Wert", ' # alt: "Old value"'),
+        (' k: "a "b" c" # "x"', 'a "b" c', ' # "x"'),
+        (' k: "Er sagte \\"hi\\"" # "c"', 'Er sagte \\"hi\\"', ' # "c"'),
+        (' k: "Pfad C:\\\\" # "c"', "Pfad C:\\\\", ' # "c"'),
+        # bare quotes without a comment keep the greedy reading (real MD line)
+        (' loading_drill_master_desc:0 "§L"Shoot them again, they\'re not dead yet!"§!"',
+         '§L"Shoot them again, they\'re not dead yet!"§!', ""),
+        (' ranked: "Rank #1 nation" # trailing comment', "Rank #1 nation", " # trailing comment"),
+        (' junk: "value" trailing junk', "value", " trailing junk"),
+    ],
+)
+def test_value_ends_at_the_quote_before_a_comment(line, val, trail):
+    lf = locfile.parse_text("l_german:\n" + line + "\n")
+    (e,) = lf.entries
+    assert (e.val, e.trail) == (val, trail)
+    assert e.line() == line

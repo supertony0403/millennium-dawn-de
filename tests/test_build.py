@@ -209,12 +209,91 @@ def test_missing_build_info_is_an_error(md_root, mod, cache):
     assert run_check(md_root, mod).exit_code == 1
 
 
-def test_cli_build_then_check(md_root, mod, cache, monkeypatch, capsys):
+def test_cli_build_then_check(md_root, mod, cache, monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("MDDE_MD_ROOT", str(md_root))
     monkeypatch.setenv("MDDE_MOD_ROOT", str(mod))
+    monkeypatch.setenv("MDDE_VANILLA_DE", str(tmp_path / "no_vanilla"))
     assert main(["build"]) == 0
     assert main(["check"]) == 0
     text = capsys.readouterr().out
     assert "10" in text
     edit(mod, "MD_focus_GER_l_german.yml", '"Deutsche Einheit"', '"Deutsche §YEinheit"')
     assert main(["check"]) == 1
+
+
+# -- review finding (small 3): untranslated fallback must not cover vanilla German -------
+def test_untranslated_key_known_to_vanilla_german_is_not_appended(md_root, mod):
+    empty = TranslationCache(mod / "cache" / "none.jsonl")
+    report = buildmod.build(md_root, mod / "localisation" / "german", empty,
+                            info_path=mod / "build_info.json", vanilla_keys={"GER_focus_new", "SAF_trait_x"})
+    focus = out(mod, "MD_focus_GER_l_german.yml").decode("utf-8-sig")
+    assert "GER_focus_new" not in focus
+    traits = out(mod, "traits/SAF_traits_l_german.yml").decode("utf-8-sig")
+    assert "SAF_trait_x" not in traits and "brave_trait" in traits
+    assert report.vanilla_kept == 2
+
+
+def test_translated_key_is_appended_even_if_vanilla_knows_it(md_root, mod, cache):
+    buildmod.build(md_root, mod / "localisation" / "german", cache,
+                   info_path=mod / "build_info.json", vanilla_keys={"GER_focus_new"})
+    assert ' GER_focus_new:0 "Brandneuer Fokus"' in out(mod, "MD_focus_GER_l_german.yml").decode("utf-8-sig")
+
+
+def test_vanilla_keys_are_read_recursively(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "a_l_german.yml").write_text('\ufeffl_german:\n A_KEY:0 "A"\n', encoding="utf-8")
+    (tmp_path / "b_l_german.yml").write_text('l_german:\n B_KEY: "B"\n', encoding="utf-8")
+    assert buildmod.vanilla_keys(tmp_path) == {"A_KEY", "B_KEY"}
+    assert buildmod.vanilla_keys(tmp_path / "missing") == frozenset()
+
+
+def test_cli_build_respects_vanilla_dir(md_root, mod, cache, monkeypatch, tmp_path):
+    vanilla = tmp_path / "vanilla"
+    vanilla.mkdir()
+    (vanilla / "x_l_german.yml").write_text('l_german:\n brave_trait: "Tapfer"\n', encoding="utf-8")
+    monkeypatch.setenv("MDDE_MD_ROOT", str(md_root))
+    monkeypatch.setenv("MDDE_MOD_ROOT", str(mod))
+    monkeypatch.setenv("MDDE_VANILLA_DE", str(vanilla))
+    (mod / "cache" / "translations.jsonl").unlink()
+    assert main(["build"]) == 0
+    assert "brave_trait" not in out(mod, "traits/SAF_traits_l_german.yml").decode("utf-8-sig")
+
+
+# -- review finding (small 4): no key in two output files --------------------------------
+def shared_key_tree(md_root):
+    en = md_root / "localisation" / "english"
+    (en / "aaa_l_english.yml").write_text('\ufeffl_english:\n SHARED_key:0 "Shared text"\n', encoding="utf-8")
+    (en / "zzz_l_english.yml").write_text('\ufeffl_english:\n SHARED_key:0 "Shared text"\n OWN:0 "Own"\n',
+                                          encoding="utf-8")
+    (md_root / "localisation" / "german" / "zzz_l_german.yml").write_text(
+        '\ufeffl_german:\n OWN:0 "Eigen"\n', encoding="utf-8")
+
+
+def defining_files(mod, key):
+    root = mod / "localisation" / "german"
+    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*.yml")
+                  if f" {key}:" in p.read_text(encoding="utf-8-sig"))
+
+
+def test_key_missing_in_german_is_written_to_one_output_file_only(md_root, mod, cache):
+    shared_key_tree(md_root)
+    run_build(md_root, mod, cache)
+    assert defining_files(mod, "SHARED_key") == ["aaa_l_german.yml"]
+    assert run_check(md_root, mod).exit_code == 0
+
+
+def test_check_reports_a_key_defined_in_two_output_files(md_root, mod, cache):
+    run_build(md_root, mod, cache)
+    path = mod / "localisation" / "german" / "countries_l_german.yml"
+    path.write_text(path.read_text(encoding="utf-8-sig") + ' GER_focus_unity: "Doppelt"\n', encoding="utf-8-sig")
+    report = run_check(md_root, mod)
+    assert report.exit_code == 1
+    assert any("GER_focus_unity" in e and "Ausgabedateien" in e for e in report.errors), report.errors
+
+
+def test_duplicates_inherited_from_millennium_dawn_are_only_a_warning(md_root, mod, cache):
+    run_build(md_root, mod, cache)  # GER_event_title is in MD_events and MD_subideology_parties
+    report = run_check(md_root, mod)
+    assert report.errors == []
+    assert report.exit_code == 0
+    assert any("GER_event_title" in w for w in report.md_duplicates), report.md_duplicates

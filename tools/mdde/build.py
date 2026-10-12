@@ -6,19 +6,28 @@ the original completely, so no key is defined twice). Each file is copied line
 by line; only values that are still English ("open") are replaced by the
 cached translation. English files without a German counterpart become new
 ``<base>_l_german.yml`` files, English keys missing from every German file are
-appended to the matching file. Without any cache entry the output is
-byte-identical to Millennium Dawn's German files (plus appended keys).
+appended to the matching file. Every such key is assigned to exactly one
+output file beforehand (the first English file that defines it), so no key
+ends up in two files. An untranslated English fallback is left out when HOI4's
+own German localisation (``vanilla_keys``) already has the key - the English
+text would otherwise cover the vanilla German one. Without any cache entry
+the output is byte-identical to Millennium Dawn's German files (plus appended
+keys).
 
 ``check`` parses the output, verifies BOM/header and the tokens of every value
-that differs from Millennium Dawn, and compares the Millennium Dawn version
-and file fingerprint with ``build_info.json``.
+that differs from Millennium Dawn, reports keys defined in more than one
+output file (an error, unless Millennium Dawn's German files already define
+the key in those files - then it is listed in ``md_duplicates``), and
+compares the Millennium Dawn version and file fingerprint with
+``build_info.json``.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import re
-from collections.abc import Callable
+from collections import defaultdict
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,6 +47,7 @@ class BuildReport:
     replaced: int = 0
     appended: int = 0
     english_fallback: int = 0
+    vanilla_kept: int = 0  # untranslated keys left to HOI4's own German text
     skipped_empty: list[str] = field(default_factory=list)
     outputs: list[str] = field(default_factory=list)
 
@@ -51,7 +61,8 @@ class CheckReport:
     files: int = 0
     checked_values: int = 0
     errors: list[str] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)  # build is stale (exit 2)
+    md_duplicates: list[str] = field(default_factory=list)  # inherited from MD, exit code unaffected
 
     @property
     def exit_code(self) -> int:
@@ -80,6 +91,15 @@ def md_fingerprint(md_root: Path) -> str:
             digest.update(f"{lang}/{path.relative_to(base).as_posix()}\0".encode())
             digest.update(hashlib.sha1(path.read_bytes()).digest())
     return digest.hexdigest()
+
+
+def vanilla_keys(de_dir: Path) -> frozenset[str]:
+    """Keys of HOI4's own German localisation (recursive); empty if missing."""
+    keys: set[str] = set()
+    if Path(de_dir).is_dir():
+        for path in sorted(Path(de_dir).rglob("*.yml")):
+            keys.update(e.key for e in locfile.parse(path).entries)
+    return frozenset(keys)
 
 
 def _new_file_rel(pair: scope.LocPair) -> str:
@@ -122,12 +142,18 @@ def _clear(out_dir: Path) -> None:
 
 # -- build -----------------------------------------------------------------------
 def build(md_root: Path, out_dir: Path, cache: TranslationCache, *, info_path: Path,
+          vanilla_keys: Collection[str] = frozenset(),
           now: Callable[[], datetime] | None = None) -> BuildReport:
     now = now or (lambda: datetime.now(timezone.utc))
     src = _Sources(md_root)
     report = BuildReport()
     _clear(out_dir)
-    appended_keys: set[str] = set()
+    # every English key missing from all German files goes to exactly one output file
+    owner: dict[str, str] = {}
+    for pair in src.pairs:
+        for key in src.en.get(pair.base, {}):
+            if key not in src.de_keys:
+                owner.setdefault(key, pair.base)
 
     def translated(key: str, en: str, current: str) -> str | None:
         """Escaped translation for an open value, else ``None``."""
@@ -138,6 +164,10 @@ def build(md_root: Path, out_dir: Path, cache: TranslationCache, *, info_path: P
             report.english_fallback += 1
             return None
         return locfile.escape_value(de)
+
+    def cached(key: str, en: str) -> str | None:
+        de = cache.get(key, en) if scope.is_open(en, en) else None
+        return None if de is None else locfile.escape_value(de)
 
     for pair in src.pairs:
         if pair.de_path is not None:
@@ -151,21 +181,30 @@ def build(md_root: Path, out_dir: Path, cache: TranslationCache, *, info_path: P
                     lf.set_value(entry, value)
                     report.replaced += 1
             for key, en in src.en.get(pair.base, {}).items():
-                if key in src.de_keys or key in appended_keys:
+                if owner.get(key) != pair.base:
                     continue
-                value = translated(key, en, en)
+                value = cached(key, en)
+                if value is None and key in vanilla_keys:
+                    report.vanilla_kept += 1
+                    continue
+                if value is None and scope.is_open(en, en):
+                    report.english_fallback += 1
                 lf.append(key, value if value is not None else en)
-                appended_keys.add(key)
                 report.appended += 1
             rel = pair.de_rel or ""
             report.mirrored += 1
         elif pair.en_path is not None:
             lf = locfile.parse(pair.en_path)
-            keep = [e for e in lf.entries if e.key not in src.de_keys]
-            if not keep:
+            drop = set()
+            for entry in lf.entries:
+                if owner.get(entry.key) != pair.base:
+                    drop.add(entry.idx)
+                elif entry.key in vanilla_keys and cached(entry.key, entry.val) is None:
+                    drop.add(entry.idx)
+                    report.vanilla_kept += 1
+            if len(drop) == len(lf.entries):
                 report.skipped_empty.append(pair.base)
                 continue
-            drop = {e.idx for e in lf.entries if e.key in src.de_keys}
             if drop:
                 lf = locfile.parse_text(
                     locfile.render([ln for i, ln in enumerate(lf.lines) if i not in drop])
@@ -193,6 +232,7 @@ def build(md_root: Path, out_dir: Path, cache: TranslationCache, *, info_path: P
         "replaced": report.replaced,
         "appended": report.appended,
         "english_fallback": report.english_fallback,
+        "vanilla_kept": report.vanilla_kept,
         "cache_entries": len(cache),
         "skipped_empty": report.skipped_empty,
         "outputs": sorted(report.outputs),
@@ -235,6 +275,12 @@ def check(md_root: Path, out_dir: Path, *, info_path: Path) -> CheckReport:
     present = {p.relative_to(out_dir).as_posix(): p for p in out_dir.rglob("*.yml")} if out_dir.exists() else {}
     for rel in sorted(expected - present.keys()):
         report.errors.append(f"{rel}: Ausgabedatei fehlt")
+    md_files: dict[str, set[str]] = defaultdict(set)  # key -> Millennium Dawn German files defining it
+    for pair in src.pairs:
+        if pair.de_path is not None:
+            for key in src.de[pair.base]:
+                md_files[key].add(pair.de_rel or "")
+    out_files: dict[str, list[str]] = defaultdict(list)  # key -> output files defining it
 
     for rel, path in sorted(present.items()):
         report.files += 1
@@ -252,6 +298,8 @@ def check(md_root: Path, out_dir: Path, *, info_path: Path) -> CheckReport:
             report.errors.append(f"{rel}: Zeile {idx + 1} nicht lesbar: {lf.lines[idx][:80]!r}")
         pair, md_values = origin.get(rel, (None, None))
         base = pair.base if pair else None
+        for key in dict.fromkeys(e.key for e in lf.entries):
+            out_files[key].append(rel)
         for entry in lf.entries:
             if md_values is not None and md_values.get(entry.key) == entry.val:
                 continue  # untouched Millennium Dawn value
@@ -259,6 +307,21 @@ def check(md_root: Path, out_dir: Path, *, info_path: Path) -> CheckReport:
             if en is not None and entry.val == en:
                 continue  # English fallback, identical to the source
             _check_value(rel, entry.key, en, entry.val, report)
+
+    inherited = []
+    for key, rels in sorted(out_files.items()):
+        if len(rels) < 2:
+            continue
+        if set(rels) <= md_files.get(key, set()):
+            inherited.append(f"{key}: {', '.join(rels)}")
+        else:
+            report.errors.append(f"{key}: in {len(rels)} Ausgabedateien definiert ({', '.join(rels)})")
+    if inherited:
+        report.md_duplicates.append(
+            f"{len(inherited)} Schluessel stehen schon bei Millennium Dawn in mehreren deutschen Dateien "
+            f"(unveraendert uebernommen), z. B. {'; '.join(inherited[:3])}"
+        )
+        report.md_duplicates.extend(inherited)
 
     if info:
         version = md_version(md_root)

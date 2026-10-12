@@ -8,8 +8,10 @@ Format (one entry per line)::
 
 * Files are UTF-8 *with* BOM; reading tolerates a missing BOM.
 * The version number after the colon is optional (``key: "x"``).
-* The value runs greedily up to the **last** ``"`` of the line, so values may
-  contain ``#`` and (rarely, in the wild) unescaped quotes.
+* The value ends at the first unescaped ``"`` after which only blanks or a
+  ``# comment`` follow (``KEY:0 "Wert" # alt: "Old"`` -> ``Wert``). If there
+  is no such quote, it runs greedily up to the **last** ``"`` of the line, so
+  values may contain ``#`` and (rarely, in the wild) unescaped quotes.
 * Everything that is not an entry (header, comments, blank lines, junk) is kept
   verbatim so that ``parse_text(t).render() == t`` for LF files.
 """
@@ -19,9 +21,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-ENTRY_RE = re.compile(
-    r'^(?P<indent>[ \t]*)(?P<key>[^\s:#"]+):(?P<ver>\d*)(?P<sep>[ \t]*)"(?P<val>.*)"(?P<trail>[^"]*)$'
-)
+ENTRY_RE = re.compile(r'^(?P<indent>[ \t]*)(?P<key>[^\s:#"]+):(?P<ver>\d*)(?P<sep>[ \t]*)"(?P<rest>.*)$')
+_COMMENT_TAIL_RE = re.compile(r"[ \t]*(?:#.*)?")
 HEADER_RE = re.compile(r"^(?P<indent>[ \t]*)l_(?P<lang>[a-z_]+):(?P<rest>[ \t]*(?:#.*)?)$")
 _BARE_QUOTE_RE = re.compile(r'(?<!\\)"')
 
@@ -84,6 +85,26 @@ class LocFile:
         return render(self.lines)
 
 
+def split_value(rest: str) -> tuple[str, str] | None:
+    """Split the text after the opening quote into ``(value, trail)``.
+
+    Escape-aware first: the first unescaped quote followed by nothing but
+    blanks or a comment closes the value. Otherwise greedy: the last quote of
+    the line (``None`` if there is none).
+    """
+    i = 0
+    while i < len(rest):
+        char = rest[i]
+        if char == "\\":
+            i += 2
+            continue
+        if char == '"' and _COMMENT_TAIL_RE.fullmatch(rest, i + 1):
+            return rest[:i], rest[i + 1:]
+        i += 1
+    last = rest.rfind('"')
+    return None if last == -1 else (rest[:last], rest[last + 1:])
+
+
 def parse_text(text: str) -> LocFile:
     if text.startswith("﻿"):
         text = text[1:]
@@ -100,16 +121,17 @@ def parse_text(text: str) -> LocFile:
                 lf.lang = h.group("lang")
                 continue
         m = ENTRY_RE.match(line)
-        if m:
+        parts = split_value(m.group("rest")) if m else None
+        if m and parts is not None:
             lf.entries.append(
                 Entry(
                     idx=idx,
                     key=m.group("key"),
                     ver=m.group("ver"),
-                    val=m.group("val"),
+                    val=parts[0],
                     indent=m.group("indent"),
                     sep=m.group("sep"),
-                    trail=m.group("trail"),
+                    trail=parts[1],
                 )
             )
         else:

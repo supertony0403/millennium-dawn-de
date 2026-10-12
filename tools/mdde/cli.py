@@ -194,11 +194,19 @@ def cmd_revalidate(args: argparse.Namespace, cfg: Config) -> int:
 
 def cmd_build(args: argparse.Namespace, cfg: Config) -> int:
     cache = TranslationCache(cfg.translations_path)
-    report = buildmod.build(cfg.md_root, cfg.output_dir, cache, info_path=cfg.build_info_path)
+    vanilla = buildmod.vanilla_keys(cfg.vanilla_de_dir)
+    if not vanilla:
+        print(f"Warnung: keine Vanilla-Lokalisierung unter {cfg.vanilla_de_dir} (MDDE_VANILLA_DE) - "
+              "unuebersetzte Schluessel koennen deutsche Vanilla-Texte ueberdecken", file=sys.stderr)
+    report = buildmod.build(cfg.md_root, cfg.output_dir, cache, info_path=cfg.build_info_path,
+                            vanilla_keys=vanilla)
     print(f"Build: {report.files} Dateien ({report.mirrored} gespiegelt, {report.new_files} neu) "
           f"-> {cfg.output_dir}")
     print(f"  {fmt(report.replaced)} Werte uebersetzt, {fmt(report.appended)} Schluessel angehaengt, "
           f"{fmt(report.english_fallback)} Werte noch englisch (alle Scopes und Dateien, Cache: {fmt(len(cache))})")
+    if report.vanilla_kept:
+        print(f"  {fmt(report.vanilla_kept)} unuebersetzte Schluessel weggelassen, weil HOI4 selbst einen "
+              "deutschen Text dafuer hat")
     if report.skipped_empty:
         print(f"  uebersprungen (englische Datei ohne Eintraege): {', '.join(report.skipped_empty)}")
     return 0
@@ -206,14 +214,18 @@ def cmd_build(args: argparse.Namespace, cfg: Config) -> int:
 
 def cmd_check(args: argparse.Namespace, cfg: Config) -> int:
     report = buildmod.check(cfg.md_root, cfg.output_dir, info_path=cfg.build_info_path)
+    inherited = max(0, len(report.md_duplicates) - 1)
     print(f"Check: {report.files} Dateien, {fmt(report.checked_values)} geaenderte Werte geprueft, "
-          f"{len(report.errors)} Fehler, {len(report.warnings)} Warnungen")
+          f"{len(report.errors)} Fehler, {len(report.warnings)} Warnungen, "
+          f"{inherited} von Millennium Dawn uebernommene Doppel-Schluessel")
     for line in report.errors[:50]:
         print(f"  FEHLER  {line}")
     if len(report.errors) > 50:
         print(f"  ... und {len(report.errors) - 50} weitere Fehler")
     for line in report.warnings:
         print(f"  WARNUNG {line}")
+    if report.md_duplicates:
+        print(f"  WARNUNG (von Millennium Dawn, Exit-Code unberuehrt) {report.md_duplicates[0]}")
     return report.exit_code
 
 

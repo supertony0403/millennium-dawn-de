@@ -54,3 +54,21 @@ def test_real_german_md_translations_are_not_open():
     assert len(sample) >= 200
     false_alarms = [(k, de) for k, en, de in sample if scope.is_open(en, de)]
     assert false_alarms == []
+
+
+def test_every_real_md_line_is_rebuilt_byte_identically():
+    """Round trip over all English and German files: render() and each entry line."""
+    loc = MD / "localisation"
+    files = sorted((loc / "english").rglob("*.yml")) + sorted((loc / "german").rglob("*.yml"))
+    assert len(files) > 100
+    for path in files:
+        text = path.read_text(encoding="utf-8-sig")
+        lf = locfile.parse_text(text)
+        assert lf.render() == text.replace("\r\n", "\n"), path
+        for entry in lf.entries:
+            assert entry.line() == lf.lines[entry.idx], (path, entry.idx)
+
+
+def test_bare_quotes_in_real_traits_line_still_parse():
+    lf = locfile.parse(MD / "localisation/english/replace/replaced_from_vanilla_traits_l_english.yml")
+    assert lf.values()["loading_drill_master_desc"] == '§L"Shoot them again, they\'re not dead yet!"§!'
