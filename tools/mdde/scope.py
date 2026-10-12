@@ -1,6 +1,7 @@
 """Find the English texts that are still "open" (untranslated) per scope.
 
-A text is open when the English text contains real words and its German value
+A text is open when the English text contains real words (or is a short English
+phrase such as "So be it", see ``validate.short_english``) and its German value
 in Millennium Dawn is missing, equal to the English one (ignoring case and
 whitespace) or an old English copy that no longer matches the current English
 text exactly (see ``validate.stale_english``).
@@ -106,7 +107,8 @@ def discover(md_root: Path) -> list[LocPair]:
 
 
 def is_open(en: str, de_current: str | None) -> bool:
-    if not validate.has_text(en):
+    # "So be it" has no word of three letters but is a short English phrase
+    if not (validate.has_text(en) or validate.short_english(en)):
         return False
     if de_current is None or validate.normalized(de_current) == validate.normalized(en):
         return True

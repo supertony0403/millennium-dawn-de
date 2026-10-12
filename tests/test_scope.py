@@ -141,3 +141,46 @@ def test_stale_english_german_value_is_open(en, de):
 )
 def test_real_german_translation_is_not_open(en, de):
     assert scope.is_open(en, de) is False
+
+
+# -- short stale English copies (2-5 words): >= 2 English stop words, no German
+# stop word, no umlaut/ß. Hand-picked from Millennium Dawn's German files.
+@pytest.mark.parametrize(
+    "en,de",
+    [
+        ("We must heed the public's demand for transparency.", "tough hit on the CDU"),
+        ("The 2001 Cebit", "Expulsion from the faction"),
+        ("Heer", "State of the Bundeswehr"),
+        ("Trust Wowereit and rebuild through reforms.", "Our trains are safe again"),
+        ("Ugra Focus Tree", "Tree of Focuses of Ugra"),
+        ("On Mission in $REG|G$", "In Mission in $REG|G$"),
+        # no word of three letters, so has_text() alone does not see it as text
+        ("So be it", "So be it"),
+        ("So be it.", "So be it."),
+    ],
+)
+def test_short_stale_english_value_is_open(en, de):
+    assert scope.is_open(en, de) is True
+
+
+def test_short_english_source_without_german_value_is_open():
+    assert scope.is_open("So be it", None) is True
+
+
+@pytest.mark.parametrize(
+    "en,de",
+    [
+        ("So be it", "So sei es"),
+        ("On Mission in $REG|G$", "Im Einsatz in $REG|G$"),
+        ("Operation in Mali", "Einsatz in Mali"),
+        # two stop words of the short rule, but a German stop word ("und")
+        ("In Europe and Asia", "In Europa und in Asien"),
+        ("The Bank of Canada", "Bank of Canada"),
+        # umlaut/ß marks German even without a German stop word
+        ("Alliance for the Future", "Bündnis for the Future"),
+        # more than five words is not a short value any more
+        ("Ugra Focus Tree", "Tree of Focuses of Ugra Region"),
+    ],
+)
+def test_short_german_or_name_value_is_not_open(en, de):
+    assert scope.is_open(en, de) is False

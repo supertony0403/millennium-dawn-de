@@ -23,6 +23,18 @@ STALE_GER_KEYS = {
     "GER_Bundeswehr_modifier_desc",
 }
 
+# Short stale copies (2-5 words), all really English, spread over several files.
+SHORT_STALE_KEYS = {
+    "germany.38.a",               # "tough hit on the CDU"
+    "germany.49.t",               # "Expulsion from the faction"
+    "GER_Bundeswehr_modifier",    # "State of the Bundeswehr"
+    "germany.39.a",               # "Our trains are safe again"
+    "EH_event.422.a",             # "So be it"
+    "gcc_invite.3.a",             # "So be it."
+    "khanti_mansi_focus",         # "Tree of Focuses of Ugra"
+    "AIRWING_MISSION_IN_REGION",  # "In Mission in $REG|G$"
+}
+
 # Independent of the implementation's stop-word lists: an umlaut/ß plus at least
 # two of these function words marks a value as German.
 _GERMAN_MARK = re.compile(r"[äöüÄÖÜß]")
@@ -34,9 +46,19 @@ def _clearly_german(text: str) -> bool:
     return bool(_GERMAN_MARK.search(text)) and sum(w in _GERMAN_WORDS for w in words) >= 2
 
 
-def test_stale_english_values_in_md_focus_ger_are_open():
-    open_keys = {i.key for i in scope.collect(MD, "germany") if i.base == "MD_focus_GER"}
+@pytest.fixture(scope="module")
+def germany_open():
+    return scope.collect(MD, "germany")
+
+
+def test_stale_english_values_in_md_focus_ger_are_open(germany_open):
+    open_keys = {i.key for i in germany_open if i.base == "MD_focus_GER"}
     assert STALE_GER_KEYS <= open_keys
+
+
+def test_short_stale_english_values_are_open(germany_open):
+    open_keys = {i.key for i in germany_open}
+    assert SHORT_STALE_KEYS <= open_keys
 
 
 def test_real_german_md_translations_are_not_open():

@@ -155,16 +155,43 @@ def looks_english(en: str, de: str) -> bool:
     )
 
 
+# Short values: two English stop words suffice when nothing marks the text as
+# German. "in" and "on" count here ("In Mission in $REG|G$", "tough hit on the
+# CDU"); they stay out of ENGLISH_STOPWORDS, so the validator is unaffected.
+SHORT_STALE_STOPWORDS = ENGLISH_STOPWORDS | frozenset({"in", "on"})
+SHORT_STALE_MIN_WORDS = 2
+SHORT_STALE_MAX_WORDS = 5
+SHORT_STALE_MIN_HITS = 2
+_GERMAN_LETTER_RE = re.compile(r"[äöüÄÖÜß]")
+
+
+def short_english(text: str) -> bool:
+    """True for a short English phrase: 2-5 words once tokens are removed, >= 2
+    stop words of ``SHORT_STALE_STOPWORDS``, no German stop word and no umlaut/ß.
+    All-caps words (acronyms) are not counted as stop words."""
+    if _GERMAN_LETTER_RE.search(strip_tokens(text)):
+        return False
+    if not SHORT_STALE_MIN_WORDS <= len(words(text)) <= SHORT_STALE_MAX_WORDS:
+        return False
+    found = [w.lower() for w in words(text, lower=False) if not w.isupper()]
+    if any(w in GERMAN_STOPWORDS for w in found):
+        return False
+    return sum(w in SHORT_STALE_STOPWORDS for w in found) >= SHORT_STALE_MIN_HITS
+
+
 def stale_english(en: str, de: str) -> bool:
     """True if a German value of Millennium Dawn is (an old copy of) English text.
 
-    Either >= 3 English and <= 1 German stop words, or more than 60 % of its
-    lower-case words occur in the English text and it has no German stop word
-    (capitalised words are skipped: names and German nouns would cause false
-    alarms such as "Osama bin Laden getötet").
+    Either >= 3 English and <= 1 German stop words, or a short English phrase
+    (see ``short_english``: "So be it", "State of the Bundeswehr"), or more than
+    60 % of its lower-case words occur in the English text and it has no German
+    stop word (capitalised words are skipped: names and German nouns would cause
+    false alarms such as "Osama bin Laden getötet").
     """
     en_hits, de_hits = _stopword_hits(de)
     if en_hits >= 3 and de_hits <= 1:
+        return True
+    if short_english(de):
         return True
     lower = [w for w in words(de, lower=False) if w.islower()]
     if len(lower) < 3 or de_hits:

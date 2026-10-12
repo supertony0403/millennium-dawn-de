@@ -13,18 +13,22 @@ Plan: `docs/superpowers/plans/2026-10-12-millennium-dawn-de-plan.md`
 
 | Scope | Inhalt | offene Texte (MD 2.0.2) |
 |---|---|---|
-| `germany` (Standard) | alles außer fremden Fokusbäumen (`MD_focus_<TAG>`), Namenslisten und Schlüsseln mit fremdem Länderkürzel (`RUS_…`, `USA.…`) – Ausnahme Ländernamen-Dateien (`countries`, `MD_countries_cosmetic`, `replaced_from_vanilla_countries_cosmetic`) | 39.622 (32.840 verschiedene Texte, ≈ 443 Anfragen) |
-| `full` | alles außer Namenslisten (`victory_points`, `state_names`, `MD_terrain_cities`, `strategic_region_names`, `supply_area_names`) | 175.546 (≈ 2.082 Anfragen) |
+| `germany` (Standard) | alles außer fremden Fokusbäumen (`MD_focus_<TAG>`), Namenslisten und Schlüsseln mit fremdem Länderkürzel (`RUS_…`, `USA.…`) – Ausnahme Ländernamen-Dateien (`countries`, `MD_countries_cosmetic`, `replaced_from_vanilla_countries_cosmetic`) | 39.633 (32.851 verschiedene Texte, ≈ 443 Anfragen) |
+| `full` | alles außer Namenslisten (`victory_points`, `state_names`, `MD_terrain_cities`, `strategic_region_names`, `supply_area_names`) | 175.618 (≈ 2.082 Anfragen) |
 
 Gleiche englische Texte unter verschiedenen Schlüsseln werden nur einmal angefragt.
 
 „Offen“ ist ein englischer Text, der ohne Formatierungs-Tokens noch mindestens drei
-aufeinanderfolgende Buchstaben enthält und dessen deutscher Wert bei Millennium Dawn fehlt,
-(bis auf Groß-/Kleinschreibung und Leerraum) identisch mit dem englischen ist oder eine
-veraltete englische Kopie ist (≥ 3 englische und ≤ 1 deutsche Stoppwörter, oder > 60 % der
-kleingeschriebenen Wörter stammen aus dem englischen Text und kein deutsches Stoppwort).
-Gegen die echten Daten geprüft: 207 solcher Kopien, 0 Fehlalarme unter 16.928 eindeutig
-deutschen MD-Werten.
+aufeinanderfolgende Buchstaben enthält (oder eine kurze englische Wendung ist, etwa „So be it“)
+und dessen deutscher Wert bei Millennium Dawn fehlt, (bis auf Groß-/Kleinschreibung und
+Leerraum) identisch mit dem englischen ist oder eine veraltete englische Kopie ist (≥ 3
+englische und ≤ 1 deutsche Stoppwörter; oder ein kurzer Wert mit 2–5 Wörtern, ≥ 2 englischen
+Stoppwörtern – hier zählen auch „in“ und „on“ –, keinem deutschen Stoppwort und keinem
+Umlaut/ß; oder > 60 % der kleingeschriebenen Wörter stammen aus dem englischen Text und kein
+deutsches Stoppwort). Gegen die echten Daten geprüft: 207 solcher Kopien, 0 Fehlalarme unter
+16.928 eindeutig deutschen MD-Werten; die Regel für kurze Werte öffnet zusätzlich 11 Texte im
+Scope `germany` (72 in `full`, alle englisch) und trifft keinen der 8.845 Werte mit Umlaut und
+≥ 2 deutschen Funktionswörtern.
 
 ## Aufruf
 
