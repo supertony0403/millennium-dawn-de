@@ -1,0 +1,114 @@
+"""Append-only translation cache and reject log."""
+from __future__ import annotations
+
+import hashlib
+import json
+import threading
+
+from mdde.cache import RejectLog, TranslationCache
+
+
+def sha1(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def test_put_then_get_with_same_english(tmp_path):
+    cache = TranslationCache(tmp_path / "cache" / "t.jsonl")
+    cache.put("GER_x", "German Unity", "Deutsche Einheit", "model/a")
+    assert cache.get("GER_x", "German Unity") == "Deutsche Einheit"
+
+
+def test_changed_english_text_invalidates_entry(tmp_path):
+    cache = TranslationCache(tmp_path / "t.jsonl")
+    cache.put("GER_x", "German Unity", "Deutsche Einheit", "model/a")
+    assert cache.get("GER_x", "German Unity!") is None
+    assert cache.get("OTHER", "German Unity") is None
+
+
+def test_record_format_on_disk(tmp_path):
+    path = tmp_path / "t.jsonl"
+    TranslationCache(path).put("GER_x", "German Unity", "Deutsche Einheit", "model/a")
+    record = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert record["key"] == "GER_x"
+    assert record["src_sha1"] == sha1("German Unity")
+    assert record["de"] == "Deutsche Einheit"
+    assert record["model"] == "model/a"
+    assert record["ts"].endswith("Z")
+
+
+def test_entries_survive_reload(tmp_path):
+    path = tmp_path / "t.jsonl"
+    TranslationCache(path).put("k", "Hello world", "Hallo Welt", "m")
+    reloaded = TranslationCache(path)
+    assert reloaded.get("k", "Hello world") == "Hallo Welt"
+    assert len(reloaded) == 1
+
+
+def test_last_duplicate_wins(tmp_path):
+    path = tmp_path / "t.jsonl"
+    cache = TranslationCache(path)
+    cache.put("k", "Hello world", "Hallo Welt", "m1")
+    cache.put("k", "Hello world", "Servus Welt", "m2")
+    assert TranslationCache(path).get("k", "Hello world") == "Servus Welt"
+
+
+def test_broken_lines_are_skipped(tmp_path):
+    path = tmp_path / "t.jsonl"
+    good = {"key": "k", "src_sha1": sha1("Hello world"), "de": "Hallo Welt", "model": "m", "ts": "x"}
+    path.write_text(
+        "{kaputt\n"
+        + json.dumps(good)
+        + "\n"
+        + json.dumps({"key": "nur_key"})
+        + "\n\n"
+        + '{"key": "abgeschnitten", "src_sh',
+        encoding="utf-8",
+    )
+    cache = TranslationCache(path)
+    assert cache.get("k", "Hello world") == "Hallo Welt"
+    assert len(cache) == 1
+    assert cache.skipped == 3
+
+
+def test_missing_file_is_an_empty_cache(tmp_path):
+    cache = TranslationCache(tmp_path / "nope" / "t.jsonl")
+    assert len(cache) == 0
+    assert cache.get("k", "x") is None
+
+
+def test_put_is_on_disk_immediately(tmp_path):
+    path = tmp_path / "t.jsonl"
+    cache = TranslationCache(path)
+    cache.put("k", "Hello world", "Hallo Welt", "m")
+    assert "Hallo Welt" in path.read_text(encoding="utf-8")
+
+
+def test_concurrent_puts_produce_whole_lines(tmp_path):
+    path = tmp_path / "t.jsonl"
+    cache = TranslationCache(path)
+
+    def worker(n: int) -> None:
+        for i in range(200):
+            cache.put(f"k{n}_{i}", f"English text {n} {i}", "x" * 500, "m")
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1600
+    assert all(json.loads(line)["de"] == "x" * 500 for line in lines)
+    assert len(TranslationCache(path)) == 1600
+
+
+def test_reject_log_records_and_reloads(tmp_path):
+    path = tmp_path / "rejects.jsonl"
+    log = RejectLog(path)
+    log.add("k", "Hello world", "tokens", model="m", de="Hallo")
+    record = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert record["reason"] == "tokens"
+    assert record["src_sha1"] == sha1("Hello world")
+    assert record["en"] == "Hello world"
+    assert RejectLog(path).contains("k", "Hello world")
+    assert not RejectLog(path).contains("k", "Hello world, changed")
